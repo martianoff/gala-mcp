@@ -1,0 +1,73 @@
+package mcp
+
+// ProtocolVersion is the MCP protocol revision this runtime implements.
+val ProtocolVersion = "2025-06-18"
+
+// JSON-RPC 2.0 error codes (see https://www.jsonrpc.org/specification).
+val CodeParseError     = -32700
+val CodeInvalidRequest = -32600
+val CodeMethodNotFound = -32601
+val CodeInvalidParams  = -32602
+val CodeInternalError  = -32603
+
+// ToolResult is what a tool handler returns: a block of text plus a flag
+// indicating whether the text describes an error (surfaced to the LLM via
+// the MCP `isError` field rather than as a protocol-level error).
+struct ToolResult(Text string, IsError bool)
+
+// NewTool builds a Tool. Cross-module-safe alternative to the Tool named-arg
+// struct constructor (which needs this module's GALA metadata at the call
+// site); external servers should build tools through this function.
+func NewTool(
+    name string,
+    description string,
+    inputSchema JsonValue,
+    handler func(JsonValue) ToolResult,
+) Tool = Tool(name, description, inputSchema, handler)
+
+// Failed reports whether this result represents an error. Prefer this over
+// reading the IsError field directly from another module — a cross-module
+// struct field read does not unwrap from std.Immutable, but a method's
+// declared return type does.
+func (r ToolResult) Failed() bool = r.IsError
+
+// Message returns the result's text payload (cross-module-safe accessor).
+func (r ToolResult) Message() string = r.Text
+
+// OkResult builds a successful tool result.
+func OkResult(text string) ToolResult = ToolResult(text, false)
+
+// ErrResult builds a failed tool result. The error stays inside the tool
+// response (isError=true) so the model can read and react to it.
+func ErrResult(text string) ToolResult = ToolResult(text, true)
+
+// Tool is a single MCP tool: its advertised metadata plus the handler that
+// runs when a client calls it. The handler receives the call's `arguments`
+// object as a JsonValue and returns a ToolResult.
+struct Tool(
+    Name        string,
+    Description string,
+    InputSchema JsonValue,
+    Handler     func(JsonValue) ToolResult,
+)
+
+// --- JSON-RPC response builders (over JsonValue) ---
+
+// successResponse builds a JSON-RPC success envelope.
+func successResponse(id JsonValue, result JsonValue) JsonValue =
+    JObjOf(
+        JField("jsonrpc", JStr("2.0")),
+        JField("id", id),
+        JField("result", result),
+    )
+
+// errorResponse builds a JSON-RPC error envelope.
+func errorResponse(id JsonValue, code int, message string) JsonValue =
+    JObjOf(
+        JField("jsonrpc", JStr("2.0")),
+        JField("id", id),
+        JField("error", JObjOf(
+            JField("code", JInt(code)),
+            JField("message", JStr(message)),
+        )),
+    )

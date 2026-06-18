@@ -1,0 +1,134 @@
+package mcp
+
+import (
+    "bufio"
+    "os"
+    "strings"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/go_interop"
+)
+
+// maxLine bounds a single newline-delimited JSON-RPC message (10 MiB).
+val maxLine = 10 * 1024 * 1024
+
+// Server is an MCP server runtime: server identity plus the registered tools.
+// It speaks JSON-RPC 2.0 over newline-delimited stdio (the transport Claude
+// Desktop / Claude Code use for local servers).
+//
+// Build one with NewServer, attach tools with WithTool, then call Run to
+// serve over stdio. Server is immutable — WithTool returns a new value.
+struct Server(
+    Name    string,
+    Version string,
+    Tools   Array[Tool],
+)
+
+// NewServer creates an MCP server with no tools registered.
+func NewServer(name string, version string) Server =
+    Server(name, version, EmptyArray[Tool]())
+
+// WithTool returns a copy of the server with one more tool registered.
+func (s Server) WithTool(t Tool) Server = s.Copy(Tools = s.Tools.Append(t))
+
+// Run serves JSON-RPC requests over stdin/stdout until stdin reaches EOF.
+// Each line of input is one request; each response is written as one line.
+func (s Server) Run() {
+    val scanner = bufio.NewScanner(os.Stdin)
+    scanner.Buffer(SliceWithCapacity[byte](64 * 1024), maxLine)
+    for scanner.Scan() {
+        val line = scanner.Text()
+        s.HandleLine(line).ForEach((out) => { Println(out) })
+    }
+}
+
+// HandleLine processes a single raw input line and returns the response line
+// to write back, or None when the input warrants no response (a blank line or
+// a JSON-RPC notification). This is the pure core of the server and is what
+// tests drive directly.
+func (s Server) HandleLine(line string) Option[string] {
+    val trimmed = strings.TrimSpace(line)
+    if trimmed == "" {
+        return None[string]()
+    }
+    return ParseJson(trimmed) match {
+        case Success(request) => s.dispatch(request).Map((resp) => RenderJson(resp))
+        case Failure(_) =>
+            Some(RenderJson(errorResponse(JNull(), CodeParseError, "parse error")))
+    }
+}
+
+// dispatch routes a parsed request to its handler, returning None for
+// notifications (requests with no id), which must not produce a response.
+func (s Server) dispatch(request JsonValue) Option[JsonValue] {
+    val idField = request.Get("id")
+    val method = request.GetString("method").GetOrElse("")
+    val id = idField.GetOrElse(JNull())
+    val isNotification = idField.IsEmpty()
+
+    return method match {
+        case "initialize" => Some(successResponse(id, s.initializeResult()))
+        case "tools/list" => Some(successResponse(id, s.toolsListResult()))
+        case "tools/call" => Some(s.handleToolCall(id, request))
+        case "ping" => Some(successResponse(id, JObjOf()))
+        // notifications/initialized and any other notification: stay silent.
+        case _ =>
+            if (isNotification) None[JsonValue]()
+            else Some(errorResponse(id, CodeMethodNotFound, s"method not found: $method"))
+    }
+}
+
+// initializeResult reports protocol version, capabilities and identity.
+func (s Server) initializeResult() JsonValue =
+    JObjOf(
+        JField("protocolVersion", JStr(ProtocolVersion)),
+        JField("capabilities", JObjOf(
+            JField("tools", JObjOf()),
+        )),
+        JField("serverInfo", JObjOf(
+            JField("name", JStr(s.Name)),
+            JField("version", JStr(s.Version)),
+        )),
+    )
+
+// toolsListResult advertises every registered tool and its input schema.
+func (s Server) toolsListResult() JsonValue =
+    JObjOf(
+        JField("tools", JArr(s.Tools.Map(toolDescriptor))),
+    )
+
+func toolDescriptor(t Tool) JsonValue =
+    JObjOf(
+        JField("name", JStr(t.Name)),
+        JField("description", JStr(t.Description)),
+        JField("inputSchema", t.InputSchema),
+    )
+
+// handleToolCall validates params, finds the tool and runs it.
+func (s Server) handleToolCall(id JsonValue, request JsonValue) JsonValue {
+    val params = request.Get("params").GetOrElse(JObjOf())
+    return params.GetString("name") match {
+        case Some(name) => {
+            val args = params.Get("arguments").GetOrElse(JObjOf())
+            s.Tools.Find((t) => t.Name == name) match {
+                case Some(tool) => successResponse(id, runTool(tool, args))
+                case _ => errorResponse(id, CodeMethodNotFound, s"unknown tool: $name")
+            }
+        }
+        case _ => errorResponse(id, CodeInvalidParams, "missing tool name")
+    }
+}
+
+// runTool invokes a tool handler (catching panics) and wraps its output in the
+// MCP CallToolResult shape: a single text content block plus the isError flag.
+func runTool(tool Tool, args JsonValue) JsonValue {
+    val result = Try(() => tool.Handler(args)).GetOrElse(ErrResult("tool handler panicked"))
+    return JObjOf(
+        JField("content", JArrOf(
+            JObjOf(
+                JField("type", JStr("text")),
+                JField("text", JStr(result.Text)),
+            ),
+        )),
+        JField("isError", JBool(result.IsError)),
+    )
+}

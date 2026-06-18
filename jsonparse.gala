@@ -1,0 +1,290 @@
+package mcp
+
+import (
+    "strconv"
+    "strings"
+    . "martianoff/gala/collection_immutable"
+)
+
+// ParseJson parses a JSON document into a JsonValue. Malformed input is
+// reported as a Failure rather than a panic.
+func ParseJson(input string) Try[JsonValue] = Try[JsonValue](() => {
+    val p = &jsonParser{data: input, pos: 0}
+    val v = p.parseValue()
+    p.skipWs()
+    if p.pos < len(p.data) {
+        panic(s"json: trailing data at position ${p.pos}")
+    }
+    return v
+})
+
+// RenderJson serializes a JsonValue back to a compact JSON string.
+func RenderJson(v JsonValue) string = v match {
+    case JNull => "null"
+    case JBool(b) => boolLit(b)
+    case JNum(n) => strconv.FormatFloat(n, 'f', -1, 64)
+    case JStr(s) => escapeString(s)
+    case JArr(items) => "[" + items.Map((it) => RenderJson(it)).MkString(",") + "]"
+    case JObj(fields) =>
+        "{" + fields.Map((f) => escapeString(f.Key) + ":" + RenderJson(f.Value)).MkString(",") + "}"
+}
+
+func boolLit(b bool) string = if (b) "true" else "false"
+
+// --- Parser ---
+
+// jsonParser is a single-pass recursive-descent cursor over the input. It
+// panics on malformed input; ParseJson wraps it in Try to surface failures.
+type jsonParser struct {
+    var data string
+    var pos  int
+}
+
+func (p *jsonParser) parseValue() JsonValue {
+    val c = p.peek()
+    if c == '{' { return p.parseObject() }
+    if c == '[' { return p.parseArray() }
+    if c == '"' { return JStr(p.parseString()) }
+    if c == 't' || c == 'f' { return JBool(p.parseBool()) }
+    if c == 'n' { p.parseNull(); return JNull() }
+    return JNum(p.parseNumber())
+}
+
+func (p *jsonParser) parseObject() JsonValue {
+    p.expect('{')
+    var fields = EmptyArray[JField]()
+    if p.peek() == '}' {
+        p.pos = p.pos + 1
+        return JObj(fields)
+    }
+    var more = true
+    for more {
+        val key = p.parseString()
+        p.expect(':')
+        val value = p.parseValue()
+        fields = fields.Append(JField(key, value))
+        val sep = p.nextToken()
+        if sep == ',' {
+            more = true
+        } else if sep == '}' {
+            more = false
+        } else {
+            panic(s"json: expected ',' or '}' at position ${p.pos}")
+        }
+    }
+    return JObj(fields)
+}
+
+func (p *jsonParser) parseArray() JsonValue {
+    p.expect('[')
+    var items = EmptyArray[JsonValue]()
+    if p.peek() == ']' {
+        p.pos = p.pos + 1
+        return JArr(items)
+    }
+    var more = true
+    for more {
+        items = items.Append(p.parseValue())
+        val sep = p.nextToken()
+        if sep == ',' {
+            more = true
+        } else if sep == ']' {
+            more = false
+        } else {
+            panic(s"json: expected ',' or ']' at position ${p.pos}")
+        }
+    }
+    return JArr(items)
+}
+
+func (p *jsonParser) parseString() string {
+    p.skipWs()
+    if p.pos >= len(p.data) || p.data[p.pos] != '"' {
+        panic(s"json: expected string at position ${p.pos}")
+    }
+    p.pos = p.pos + 1
+    var sb strings.Builder
+    for p.pos < len(p.data) {
+        val c = p.data[p.pos]
+        if c == '"' {
+            p.pos = p.pos + 1
+            return sb.String()
+        }
+        if c == '\\' {
+            p.pos = p.pos + 1
+            p.readEscape(&sb)
+        } else {
+            sb.WriteByte(c)
+            p.pos = p.pos + 1
+        }
+    }
+    panic("json: unterminated string")
+}
+
+func (p *jsonParser) readEscape(sb *strings.Builder) {
+    if p.pos >= len(p.data) {
+        panic("json: unterminated escape sequence")
+    }
+    val e = p.data[p.pos]
+    p.pos = p.pos + 1
+    if e == '"' {
+        sb.WriteByte(e)
+    } else if e == '\\' {
+        sb.WriteByte(e)
+    } else if e == '/' {
+        sb.WriteByte(e)
+    } else if e == 'n' {
+        sb.WriteByte('\n')
+    } else if e == 't' {
+        sb.WriteByte('\t')
+    } else if e == 'r' {
+        sb.WriteByte('\r')
+    } else if e == 'b' {
+        sb.WriteByte('\b')
+    } else if e == 'f' {
+        sb.WriteByte('\f')
+    } else if e == 'u' {
+        if p.pos + 4 > len(p.data) {
+            panic("json: incomplete \\u escape")
+        }
+        var hex = ""
+        var k = 0
+        for k < 4 {
+            hex = hex + string(p.data[p.pos])
+            p.pos = p.pos + 1
+            k = k + 1
+        }
+        val cp, err = strconv.ParseInt(hex, 16, 32)
+        if err != nil {
+            panic(s"json: invalid \\u escape ${hex}")
+        }
+        sb.WriteRune(rune(cp))
+    } else {
+        panic("json: invalid escape sequence")
+    }
+}
+
+func (p *jsonParser) parseNumber() float64 {
+    p.skipWs()
+    val start = p.pos
+    for p.pos < len(p.data) {
+        val c = p.data[p.pos]
+        if (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' {
+            p.pos = p.pos + 1
+        } else {
+            break
+        }
+    }
+    if p.pos == start {
+        panic(s"json: expected number at position ${p.pos}")
+    }
+    var nb strings.Builder
+    var k = start
+    for k < p.pos {
+        nb.WriteByte(p.data[k])
+        k = k + 1
+    }
+    val numStr = nb.String()
+    val v, err = strconv.ParseFloat(numStr, 64)
+    if err != nil {
+        panic(s"json: invalid number ${numStr}")
+    }
+    return v
+}
+
+func (p *jsonParser) parseBool() bool {
+    if p.matchLiteral("true") { return true }
+    if p.matchLiteral("false") { return false }
+    panic(s"json: expected boolean at position ${p.pos}")
+}
+
+func (p *jsonParser) parseNull() {
+    if p.matchLiteral("null") { return }
+    panic(s"json: expected null at position ${p.pos}")
+}
+
+func (p *jsonParser) matchLiteral(lit string) bool {
+    val n = len(lit)
+    if p.pos + n > len(p.data) { return false }
+    var k = 0
+    for k < n {
+        if p.data[p.pos + k] != lit[k] { return false }
+        k = k + 1
+    }
+    p.pos = p.pos + n
+    return true
+}
+
+// expect consumes the next non-whitespace byte, requiring it to equal ch.
+func (p *jsonParser) expect(ch byte) {
+    val c = p.nextToken()
+    if c != ch {
+        panic(s"json: expected '${string(ch)}' at position ${p.pos}")
+    }
+}
+
+// peek returns the next non-whitespace byte without consuming it (0 at EOF).
+func (p *jsonParser) peek() byte {
+    p.skipWs()
+    if p.pos >= len(p.data) {
+        panic("json: unexpected end of input")
+    }
+    return p.data[p.pos]
+}
+
+// nextToken consumes and returns the next non-whitespace byte (0 at EOF).
+func (p *jsonParser) nextToken() byte {
+    p.skipWs()
+    if p.pos >= len(p.data) { return byte(0) }
+    val c = p.data[p.pos]
+    p.pos = p.pos + 1
+    return c
+}
+
+func (p *jsonParser) skipWs() {
+    for p.pos < len(p.data) {
+        val c = p.data[p.pos]
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+            p.pos = p.pos + 1
+        } else {
+            return
+        }
+    }
+}
+
+// --- Serializer helpers ---
+
+func escapeString(s string) string {
+    var sb strings.Builder
+    sb.WriteByte('"')
+    var i = 0
+    for i < len(s) {
+        val c = s[i]
+        if c == '"' {
+            sb.WriteString("\\\"")
+        } else if c == '\\' {
+            sb.WriteString("\\\\")
+        } else if c == '\n' {
+            sb.WriteString("\\n")
+        } else if c == '\r' {
+            sb.WriteString("\\r")
+        } else if c == '\t' {
+            sb.WriteString("\\t")
+        } else if c < 32 {
+            sb.WriteString("\\u" + hex4(c))
+        } else {
+            sb.WriteByte(c)
+        }
+        i = i + 1
+    }
+    sb.WriteByte('"')
+    return sb.String()
+}
+
+// hex4 renders a control byte (< 32) as a 4-digit lowercase hex escape body.
+func hex4(c byte) string {
+    val digits = "0123456789abcdef"
+    val hi = string(digits[(c >> 4) & 15])
+    val lo = string(digits[c & 15])
+    return "00" + hi + lo
+}

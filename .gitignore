@@ -1,0 +1,17 @@
+# === GALA build artifacts ===
+# Local analysis cache written by `gala build` / `gala test`. (Build
+# workspaces and the transpiled .gen.go output live globally under ~/.gala.)
+.gala/
+# Transpiled Go output, if it ever leaks into the source tree.
+*.gen.go
+# Built binaries from `gala build`.
+*.exe
+
+# === Bazel ===
+/bazel-*
+
+# === JetBrains IDEs ===
+.idea/
+
+# === macOS ===
+.DS_Store

@@ -1,0 +1,66 @@
+package mcp
+
+import (
+    . "martianoff/gala/test"
+)
+
+func TestRenderPrimitives(t T) T {
+    val t1 = Eq(t, RenderJson(JNull()), "null")
+    val t2 = Eq(t1, RenderJson(JBool(true)), "true")
+    val t3 = Eq(t2, RenderJson(JBool(false)), "false")
+    val t4 = Eq(t3, RenderJson(JInt(42)), "42")
+    val t5 = Eq(t4, RenderJson(JStr("hi")), "\"hi\"")
+    return Eq(t5, RenderJson(JStr("a\"b\nc")), "\"a\\\"b\\nc\"")
+}
+
+func TestRenderObjectPreservesOrder(t T) T {
+    val obj = JObjOf(
+        JField("name", JStr("Apple")),
+        JField("ticker", JStr("AAPL")),
+        JField("score", JInt(7)),
+    )
+    return Eq(t, RenderJson(obj), "{\"name\":\"Apple\",\"ticker\":\"AAPL\",\"score\":7}")
+}
+
+func TestRenderNestedArray(t T) T {
+    val v = JObjOf(
+        JField("tags", JArrOf(JStr("a"), JStr("b"))),
+        JField("ok", JBool(true)),
+    )
+    return Eq(t, RenderJson(v), "{\"tags\":[\"a\",\"b\"],\"ok\":true}")
+}
+
+func TestParseRoundTrip(t T) T {
+    return RunCases[string, string](t,
+        (sub T, input string, expected string) =>
+            Eq(sub, ParseJson(input).Map((v) => RenderJson(v)).GetOrElse("<err>"), expected),
+        Case[string, string](Name = "null", Input = "null", Expected = "null"),
+        Case[string, string](Name = "true", Input = "  true ", Expected = "true"),
+        Case[string, string](Name = "int", Input = "123", Expected = "123"),
+        Case[string, string](Name = "neg", Input = "-7", Expected = "-7"),
+        Case[string, string](Name = "string", Input = "\"hello\"", Expected = "\"hello\""),
+        Case[string, string](Name = "array", Input = "[1, 2, 3]", Expected = "[1,2,3]"),
+        Case[string, string](Name = "object", Input = "{\"a\": 1, \"b\": [true, null]}", Expected = "{\"a\":1,\"b\":[true,null]}"),
+        Case[string, string](Name = "nested", Input = "{\"x\": {\"y\": \"z\"}}", Expected = "{\"x\":{\"y\":\"z\"}}"),
+    )
+}
+
+func TestParseAccessors(t T) T {
+    val parsed = ParseJson("{\"name\": \"Apple\", \"pe\": 28, \"profile\": {\"sector\": \"Tech\"}}")
+    val v = parsed.GetOrElse(JNull())
+    val t1 = IsSuccess(t, parsed)
+    val t2 = Eq(t1, v.GetString("name").GetOrElse("?"), "Apple")
+    val t3 = Eq(t2, v.GetInt("pe").GetOrElse(0), 28)
+    val sector = (v.Get("profile") match {
+        case Some(p) => p.GetString("sector")
+        case _ => None[string]()
+    }).GetOrElse("?")
+    val t4 = Eq(t3, sector, "Tech")
+    return IsNone(t4, v.GetString("missing"))
+}
+
+func TestParseInvalid(t T) T {
+    val t1 = IsFailure(t, ParseJson("{bad"))
+    val t2 = IsFailure(t1, ParseJson("[1, 2"))
+    return IsFailure(t2, ParseJson(""))
+}

@@ -1,0 +1,87 @@
+package mcp
+
+import (
+    . "martianoff/gala/test"
+    . "martianoff/gala/collection_immutable"
+)
+
+// sampleServer builds a server exposing a single `echo` tool that returns its
+// `message` argument.
+func sampleServer() Server =
+    NewServer("test-server", "1.0.0").WithTool(Tool(
+        Name = "echo",
+        Description = "Echo back the message argument",
+        InputSchema = JObjOf(
+            JField("type", JStr("object")),
+            JField("properties", JObjOf(
+                JField("message", JObjOf(JField("type", JStr("string")))),
+            )),
+        ),
+        Handler = (args) => OkResult(args.GetString("message").GetOrElse("")),
+    ))
+
+func parse(s string) JsonValue = ParseJson(s).GetOrElse(JNull())
+
+func TestInitialize(t T) T {
+    val resp = sampleServer().HandleLine("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}").GetOrElse("")
+    val v = parse(resp)
+    val t1 = Eq(t, v.GetString("jsonrpc").GetOrElse(""), "2.0")
+    val t2 = Eq(t1, v.GetInt("id").GetOrElse(-1), 1)
+    val proto = v.Get("result").GetOrElse(JNull()).GetString("protocolVersion").GetOrElse("")
+    return Eq(t2, proto, ProtocolVersion)
+}
+
+func TestToolsList(t T) T {
+    val resp = sampleServer().HandleLine("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}").GetOrElse("")
+    val v = parse(resp)
+    val arr = (v.Get("result") match {
+        case Some(r) => r.Get("tools")
+        case _ => None[JsonValue]()
+    }).GetOrElse(JArrOf()).AsArray().GetOrElse(EmptyArray[JsonValue]())
+    val firstName = arr.GetOption(0).GetOrElse(JNull()).GetString("name").GetOrElse("")
+    val t1 = Eq(t, arr.Length(), 1)
+    return Eq(t1, firstName, "echo")
+}
+
+func TestToolCallSuccess(t T) T {
+    val req = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"}}}"
+    val resp = sampleServer().HandleLine(req).GetOrElse("")
+    val result = parse(resp).Get("result").GetOrElse(JNull())
+    val isErr = result.Get("isError").GetOrElse(JBool(true)).AsBool().GetOrElse(true)
+    val t1 = IsFalse(t, isErr)
+    val text = (result.Get("content") match {
+        case Some(c) => c.AsArray().GetOrElse(EmptyArray[JsonValue]()).GetOption(0).GetOrElse(JNull()).GetString("text")
+        case _ => None[string]()
+    }).GetOrElse("")
+    return Eq(t1, text, "hi")
+}
+
+func TestToolCallUnknownTool(t T) T {
+    val req = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"nope\",\"arguments\":{}}}"
+    val resp = sampleServer().HandleLine(req).GetOrElse("")
+    val code = parse(resp).Get("error").GetOrElse(JNull()).GetInt("code").GetOrElse(0)
+    return Eq(t, code, CodeMethodNotFound)
+}
+
+func TestUnknownMethod(t T) T {
+    val resp = sampleServer().HandleLine("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"bogus\"}").GetOrElse("")
+    val code = parse(resp).Get("error").GetOrElse(JNull()).GetInt("code").GetOrElse(0)
+    return Eq(t, code, CodeMethodNotFound)
+}
+
+func TestNotificationNoResponse(t T) T =
+    IsNone(t, sampleServer().HandleLine("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"))
+
+func TestParseError(t T) T {
+    val resp = sampleServer().HandleLine("{not valid json").GetOrElse("")
+    val code = parse(resp).Get("error").GetOrElse(JNull()).GetInt("code").GetOrElse(0)
+    return Eq(t, code, CodeParseError)
+}
+
+func TestPing(t T) T {
+    val resp = sampleServer().HandleLine("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"ping\"}").GetOrElse("")
+    return IsSome(t, parse(resp).Get("result"))
+}
+
+func TestBlankLineNoResponse(t T) T =
+    IsNone(t, sampleServer().HandleLine("   "))

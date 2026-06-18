@@ -1,0 +1,116 @@
+package mcp
+
+import . "martianoff/gala/collection_immutable"
+
+// JsonValue is an immutable model of a JSON document. It backs the dynamic
+// parts of the JSON-RPC / MCP wire protocol — request ids, params, tool
+// arguments and tool results — where the shape is not known at compile time.
+//
+// Construct values directly with the case constructors (JStr, JNum, JBool,
+// JNull, JArr, JObj) or with the ergonomic helpers below (JInt, JObjOf,
+// JArrOf). Inspect them with pattern matching or the typed As*/Get accessors.
+sealed type JsonValue {
+    case JNull
+    case JBool(Bool bool)
+    case JNum(Num float64)
+    case JStr(Str string)
+    case JArr(Items Array[JsonValue])
+    case JObj(Fields Array[JField])
+}
+
+// JField is a single key/value entry of a JSON object. Objects preserve
+// insertion order so serialization is deterministic.
+struct JField(Key string, Value JsonValue)
+
+// --- Ergonomic constructors ---
+
+// JInt builds a JSON number from a Go int.
+func JInt(n int) JsonValue = JNum(float64(n))
+
+// JString builds a JSON string. Prefer this over the JStr case constructor in
+// code that imports this package from another module: a plain function call
+// resolves cleanly across module boundaries, whereas a sealed-type case
+// constructor needs the defining module's GALA metadata at the call site.
+func JString(s string) JsonValue = JStr(s)
+
+// JNumber builds a JSON number (float).
+func JNumber(n float64) JsonValue = JNum(n)
+
+// JBoolOf builds a JSON boolean.
+func JBoolOf(b bool) JsonValue = JBool(b)
+
+// JNullValue builds a JSON null.
+func JNullValue() JsonValue = JNull()
+
+// Field builds a single object entry. Cross-module-safe alternative to the
+// JField struct constructor.
+func Field(key string, value JsonValue) JField = JField(key, value)
+
+// JObjOf builds a JSON object from a varargs list of fields.
+func JObjOf(fields ...JField) JsonValue = JObj(ArrayOf(fields...))
+
+// JArrOf builds a JSON array from a varargs list of values.
+func JArrOf(items ...JsonValue) JsonValue = JArr(ArrayOf(items...))
+
+// --- Typed accessors (all total — never panic) ---
+
+// AsString returns Some(s) when this value is a JSON string.
+func (v JsonValue) AsString() Option[string] = v match {
+    case JStr(s) => Some(s)
+    case _ => None[string]()
+}
+
+// AsNum returns Some(n) when this value is a JSON number.
+func (v JsonValue) AsNum() Option[float64] = v match {
+    case JNum(n) => Some(n)
+    case _ => None[float64]()
+}
+
+// AsInt returns Some(int(n)) when this value is a JSON number, truncating.
+func (v JsonValue) AsInt() Option[int] = v match {
+    case JNum(n) => Some(int(n))
+    case _ => None[int]()
+}
+
+// AsBool returns Some(b) when this value is a JSON boolean.
+func (v JsonValue) AsBool() Option[bool] = v match {
+    case JBool(b) => Some(b)
+    case _ => None[bool]()
+}
+
+// AsArray returns Some(items) when this value is a JSON array.
+func (v JsonValue) AsArray() Option[Array[JsonValue]] = v match {
+    case JArr(items) => Some(items)
+    case _ => None[Array[JsonValue]]()
+}
+
+// AsObject returns Some(fields) when this value is a JSON object.
+func (v JsonValue) AsObject() Option[Array[JField]] = v match {
+    case JObj(fields) => Some(fields)
+    case _ => None[Array[JField]]()
+}
+
+// IsNull reports whether this value is JSON null.
+func (v JsonValue) IsNull() bool = v match {
+    case JNull => true
+    case _ => false
+}
+
+// Get looks up a field by key. Returns None when this value is not an object
+// or the key is absent.
+func (v JsonValue) Get(key string) Option[JsonValue] = v match {
+    case JObj(fields) => fields.Find((f) => f.Key == key).Map((f) => f.Value)
+    case _ => None[JsonValue]()
+}
+
+// GetString looks up a string-valued field by key.
+func (v JsonValue) GetString(key string) Option[string] =
+    v.Get(key).FlatMap[string]((x) => x.AsString())
+
+// GetInt looks up an int-valued field by key.
+func (v JsonValue) GetInt(key string) Option[int] =
+    v.Get(key).FlatMap[int]((x) => x.AsInt())
+
+// GetObject looks up an object-valued field by key, returning its fields.
+func (v JsonValue) GetObject(key string) Option[Array[JField]] =
+    v.Get(key).FlatMap[Array[JField]]((x) => x.AsObject())
