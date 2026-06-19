@@ -15,25 +15,6 @@ val CodeInternalError  = -32603
 // the MCP `isError` field rather than as a protocol-level error).
 struct ToolResult(Text string, IsError bool)
 
-// NewTool builds a Tool. Cross-module-safe alternative to the Tool named-arg
-// struct constructor (which needs this module's GALA metadata at the call
-// site); external servers should build tools through this function.
-func NewTool(
-    name string,
-    description string,
-    inputSchema JsonValue,
-    handler func(JsonValue) ToolResult,
-) Tool = Tool(name, description, inputSchema, handler)
-
-// Failed reports whether this result represents an error. Prefer this over
-// reading the IsError field directly from another module — a cross-module
-// struct field read does not unwrap from std.Immutable, but a method's
-// declared return type does.
-func (r ToolResult) Failed() bool = r.IsError
-
-// Message returns the result's text payload (cross-module-safe accessor).
-func (r ToolResult) Message() string = r.Text
-
 // OkResult builds a successful tool result.
 func OkResult(text string) ToolResult = ToolResult(text, false)
 

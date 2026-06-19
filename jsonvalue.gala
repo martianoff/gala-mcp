@@ -27,25 +27,6 @@ struct JField(Key string, Value JsonValue)
 // JInt builds a JSON number from a Go int.
 func JInt(n int) JsonValue = JNum(float64(n))
 
-// JString builds a JSON string. Prefer this over the JStr case constructor in
-// code that imports this package from another module: a plain function call
-// resolves cleanly across module boundaries, whereas a sealed-type case
-// constructor needs the defining module's GALA metadata at the call site.
-func JString(s string) JsonValue = JStr(s)
-
-// JNumber builds a JSON number (float).
-func JNumber(n float64) JsonValue = JNum(n)
-
-// JBoolOf builds a JSON boolean.
-func JBoolOf(b bool) JsonValue = JBool(b)
-
-// JNullValue builds a JSON null.
-func JNullValue() JsonValue = JNull()
-
-// Field builds a single object entry. Cross-module-safe alternative to the
-// JField struct constructor.
-func Field(key string, value JsonValue) JField = JField(key, value)
-
 // JObjOf builds a JSON object from a varargs list of fields.
 func JObjOf(fields ...JField) JsonValue = JObj(ArrayOf(fields...))
 

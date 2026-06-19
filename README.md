@@ -29,8 +29,7 @@ package main
 
 import . "github.com/martianoff/gala-mcp"
 
-// Handlers are named functions with an explicit signature (see "cross-module
-// notes" below). The argument is the tool call's `arguments` object.
+// The handler's argument is the tool call's `arguments` object.
 func greet(args JsonValue) ToolResult {
     val name = args.GetString("name").GetOrElse("world")
     return OkResult(s"Hello, $name!")
@@ -38,16 +37,16 @@ func greet(args JsonValue) ToolResult {
 
 func main() {
     NewServer("greeter", "1.0.0")
-        .WithTool(NewTool(
-            "greet",
-            "Greet someone by name.",
-            JObjOf(
-                Field("type", JString("object")),
-                Field("properties", JObjOf(
-                    Field("name", JObjOf(Field("type", JString("string")))),
+        .WithTool(Tool(
+            Name = "greet",
+            Description = "Greet someone by name.",
+            InputSchema = JObjOf(
+                JField("type", JStr("object")),
+                JField("properties", JObjOf(
+                    JField("name", JObjOf(JField("type", JStr("string")))),
                 )),
             ),
-            greet,
+            Handler = greet,
         ))
         .Run()
 }
@@ -63,29 +62,15 @@ func main() {
 | `(Server) WithTool(t Tool) Server` | Return a copy with one more tool (immutable). |
 | `(Server) Run()` | Serve JSON-RPC over stdin/stdout until EOF. |
 | `(Server) HandleLine(line) Option[string]` | Pure core: one request line → optional response line. Ideal for tests. |
-| `NewTool(name, description, inputSchema, handler) Tool` | Build a tool; `handler` is `func(JsonValue) ToolResult`. |
+| `Tool(Name, Description, InputSchema, Handler)` | A tool; `Handler` is `func(JsonValue) ToolResult`. |
 | `OkResult(text) / ErrResult(text)` | Build a tool result; `ErrResult` sets `isError`. |
-| `(ToolResult) Failed() bool` / `(ToolResult) Message() string` | Cross-module-safe accessors. |
+| `ToolResult.Text` / `ToolResult.IsError` | The result's text payload and error flag. |
 
 **JSON values** — `JsonValue` is a sealed type: `JNull`, `JBool`, `JNum`, `JStr`, `JArr`, `JObj`.
 
 | Builder | Accessor |
 |---------|----------|
-| `JString(s)`, `JInt(n)`, `JNumber(f)`, `JBoolOf(b)`, `JNullValue()` | `AsString()`, `AsInt()`, `AsNum()`, `AsBool()` → `Option[T]` |
-| `JObjOf(fields...)`, `Field(key, value)` | `Get(key)`, `GetString(key)`, `GetInt(key)`, `GetObject(key)` |
+| `JStr(s)`, `JInt(n)`, `JNum(f)`, `JBool(b)`, `JNull()` | `AsString()`, `AsInt()`, `AsNum()`, `AsBool()` → `Option[T]` |
+| `JObjOf(fields...)`, `JField(key, value)` | `Get(key)`, `GetString(key)`, `GetInt(key)`, `GetObject(key)` |
 | `JArrOf(items...)` | `AsArray()` → `Option[Array[JsonValue]]` |
 | `ParseJson(s) Try[JsonValue]` | `RenderJson(v) string` |
-
-## Cross-module notes
-
-When this package is imported from **another module**, prefer the plain constructor functions
-over the underlying sealed-type / struct constructors, and write tool handlers as **named
-functions** rather than lambdas:
-
-- Build values with `NewTool`, `JObjOf`, `JArrOf`, `Field`, `JString`, … (plain functions that
-  resolve cleanly across modules) — not `Tool{...}`, `JStr(...)`, `JField(...)` directly.
-- Write handlers as named `func(JsonValue) ToolResult`, not inline lambdas.
-- Read `ToolResult` via `Failed()` / `Message()`, not the `IsError` / `Text` fields.
-
-These conventions exist because of a few cross-module type-inference gaps in the current GALA
-transpiler; the in-module API (sealed constructors, lambdas, field reads) is unaffected.
