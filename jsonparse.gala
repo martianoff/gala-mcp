@@ -1,291 +1,350 @@
 package mcp
 
 import (
-    "martianoff/gala/go_builtins"
+    "math"
     "strconv"
     "strings"
+    "unicode/utf16"
+    "unicode/utf8"
+    "martianoff/gala/go_interop"
+    "martianoff/gala/json"
     . "martianoff/gala/collection_immutable"
 )
 
-// ParseJson parses a JSON document into a JsonValue. Malformed input is
-// reported as a Failure rather than a panic.
-func ParseJson(input string) Try[JsonValue] = Try[JsonValue](() => {
-    val p = &jsonParser{data: input, pos: 0}
-    val v = p.parseValue()
-    p.skipWs()
-    if p.pos < p.data.ByteSize() {
-        go_builtins.Panic(s"json: trailing data at position ${p.pos}")
-    }
-    return v
-})
+// MaxJsonDepth is the deepest array/object nesting ParseJson accepts. Deeper
+// input fails with a JsonSyntaxError instead of exhausting the stack.
+val MaxJsonDepth = 512
 
-// RenderJson serializes a JsonValue back to a compact JSON string.
-func RenderJson(v JsonValue) string = v match {
-    case JNull => "null"
-    case JBool(b) => boolLit(b)
-    case JNum(n) => strconv.FormatFloat(n, 'f', -1, 64)
-    case JStr(s) => escapeString(s)
-    case JArr(items) => "[" + items.Map((it) => RenderJson(it)).MkString(",") + "]"
-    case JObj(fields) =>
-        "{" + fields.Map((f) => escapeString(f.Key) + ":" + RenderJson(f.Value)).MkString(",") + "}"
+// JsonSyntaxError reports malformed JSON input.
+// Msg: what was wrong, e.g. "unexpected end of input".
+// Offset: 0-based byte offset of the offending byte; the input length when the input ended early.
+struct JsonSyntaxError(Msg string, Offset int)
+
+// Error renders the error as "json: <Msg> at position <Offset>".
+func (e JsonSyntaxError) Error() string = s"json: ${e.Msg} at position ${e.Offset}"
+
+// ParseJson parses one RFC 8259 JSON document into a JsonValue. Malformed
+// input is a Failure holding a JsonSyntaxError. A number too large for a
+// float64 (such as 1e400) is malformed input; one too small to represent
+// (such as 1e-400) rounds to zero. A string holding a UTF-16 surrogate escape
+// without its partner decodes it as U+FFFD, as Go's encoding/json does.
+func ParseJson(input string) Try[JsonValue] {
+    val p = &jsonParser{data: go_interop.ToBytes(input), pos: 0}
+    bind v = p.parseValue(0)
+    p.skipWs()
+    if (p.atEnd()) Success(v) else Failure(p.mismatch("end of input"))
 }
 
-func boolLit(b bool) string = if (b) "true" else "false"
+// RenderJson serializes a JsonValue to compact JSON. The output is always
+// valid JSON: NaN and the infinities, which JSON cannot spell, render as null
+// (as JavaScript's JSON.stringify does), and invalid UTF-8 in a string renders
+// as U+FFFD.
+func RenderJson(v JsonValue) string = v match {
+    case JNull => "null"
+    case JBool(b) => if (b) "true" else "false"
+    case JNum(n) => renderNumber(n)
+    case JStr(s) => quote(s)
+    case JArr(items) => "[" + items.Map((it) => RenderJson(it)).MkString(",") + "]"
+    case JObj(fields) =>
+        "{" + fields.Map((f) => quote(f.Key) + ":" + RenderJson(f.Value)).MkString(",") + "}"
+}
+
+// renderNumber writes n in the shortest form that parses back to n, in plain
+// notation for 1e-6 <= |n| < 1e21 and exponent notation outside it, matching
+// JSON.stringify and Go's encoding/json.
+func renderNumber(n float64) string {
+    if math.IsNaN(n) || math.IsInf(n, 0) {
+        return "null"
+    }
+    val abs = math.Abs(n)
+    if abs != 0 && (abs < 1e-6 || abs >= 1e21) {
+        // 'e' pads a negative exponent to two digits (1e-07); JSON needs no padding.
+        return strings.Replace(strconv.FormatFloat(n, 'e', -1, 64), "e-0", "e-", 1)
+    }
+    strconv.FormatFloat(n, 'f', -1, 64)
+}
+
+// quote renders s as a JSON string literal with the standard library's JSON
+// string escaper.
+func quote(s string) string {
+    val e = json.NewJsonEncoder()
+    e.WriteString(strings.ToValidUTF8(s, "\uFFFD"))
+    e.String()
+}
 
 // --- Parser ---
 
-// jsonParser is a single-pass recursive-descent cursor over the input. It
-// panics on malformed input; ParseJson wraps it in Try to surface failures.
+// jsonParser is a single-pass recursive-descent cursor over the input bytes.
+// Every parse method leaves the cursor just past what it consumed and returns
+// malformed input as a Failure holding a JsonSyntaxError.
 type jsonParser struct {
-    var data string
+    var data []byte
     var pos  int
 }
 
-func (p *jsonParser) parseValue() JsonValue {
-    val c = p.peek()
-    if c == '{' { return p.parseObject() }
-    if c == '[' { return p.parseArray() }
-    if c == '"' { return JStr(p.parseString()) }
-    if c == 't' || c == 'f' { return JBool(p.parseBool()) }
-    if c == 'n' { p.parseNull(); return JNull() }
-    return JNum(p.parseNumber())
-}
-
-func (p *jsonParser) parseObject() JsonValue {
-    p.expect('{')
-    var fields = EmptyArray[JField]()
-    if p.peek() == '}' {
-        p.pos = p.pos + 1
-        return JObj(fields)
-    }
-    var more = true
-    for more {
-        val key = p.parseString()
-        p.expect(':')
-        val value = p.parseValue()
-        fields = fields.Append(JField(key, value))
-        val sep = p.nextToken()
-        if sep == ',' {
-            more = true
-        } else if sep == '}' {
-            more = false
-        } else {
-            go_builtins.Panic(s"json: expected ',' or '}' at position ${p.pos}")
-        }
-    }
-    return JObj(fields)
-}
-
-func (p *jsonParser) parseArray() JsonValue {
-    p.expect('[')
-    var items = EmptyArray[JsonValue]()
-    if p.peek() == ']' {
-        p.pos = p.pos + 1
-        return JArr(items)
-    }
-    var more = true
-    for more {
-        items = items.Append(p.parseValue())
-        val sep = p.nextToken()
-        if sep == ',' {
-            more = true
-        } else if sep == ']' {
-            more = false
-        } else {
-            go_builtins.Panic(s"json: expected ',' or ']' at position ${p.pos}")
-        }
-    }
-    return JArr(items)
-}
-
-func (p *jsonParser) parseString() string {
+// parseValue parses the value starting at the next non-whitespace byte.
+// depth: how many arrays and objects enclose the value.
+func (p *jsonParser) parseValue(depth int) Try[JsonValue] {
     p.skipWs()
-    if p.pos >= p.data.ByteSize() || p.data[p.pos] != '"' {
-        go_builtins.Panic(s"json: expected string at position ${p.pos}")
+    val c = p.peek()
+    c match {
+        case '{' => p.parseObject(depth + 1)
+        case '[' => p.parseArray(depth + 1)
+        case '"' => p.parseString().Map((s) => JStr(s))
+        case 't' => p.parseLiteral("true", JBool(true))
+        case 'f' => p.parseLiteral("false", JBool(false))
+        case 'n' => p.parseLiteral("null", JNull())
+        case _ if c == '-' || isDigit(c) => p.parseNumber()
+        case _ => Failure(p.mismatch("value"))
+    }
+}
+
+// parseObject parses an object; the cursor is on its '{'.
+// depth: the nesting depth of the object itself.
+func (p *jsonParser) parseObject(depth int) Try[JsonValue] =
+    parseSeq(p, depth, '}', () => p.parseField(depth)).Map((fields) => JObj(fields))
+
+// parseArray parses an array; the cursor is on its '['.
+// depth: the nesting depth of the array itself.
+func (p *jsonParser) parseArray(depth int) Try[JsonValue] =
+    parseSeq(p, depth, ']', () => p.parseValue(depth)).Map((items) => JArr(items))
+
+// parseSeq parses the comma-separated elements of an array or object; the
+// cursor is on its opening bracket.
+// depth: the nesting depth of the array or object itself.
+// close: the closing bracket.
+// elem: parses one element.
+func parseSeq[E any](p *jsonParser, depth int, close byte, elem func() Try[E]) Try[Array[E]] {
+    if depth > MaxJsonDepth {
+        return Failure(JsonSyntaxError(s"nesting deeper than $MaxJsonDepth levels", p.pos))
     }
     p.pos = p.pos + 1
-    var sb strings.Builder
-    for p.pos < p.data.ByteSize() {
-        val c = p.data[p.pos]
-        if c == '"' {
-            p.pos = p.pos + 1
-            return sb.String()
-        }
-        if c == '\\' {
-            p.pos = p.pos + 1
-            p.readEscape(&sb)
-        } else {
-            sb.WriteByte(c)
-            p.pos = p.pos + 1
-        }
+    p.skipWs()
+    if p.peek() == close {
+        p.pos = p.pos + 1
+        return Success(EmptyArray[E]())
     }
-    go_builtins.Panic("json: unterminated string")
+    var items = EmptyArray[E]()
+    for {
+        elem() match {
+            case Success(it) => { items = items.Append(it) }
+            case Failure(e) => { return Failure(e) }
+        }
+        p.skipWs()
+        val sep = p.peek()
+        if sep == close {
+            p.pos = p.pos + 1
+            return Success(items)
+        }
+        if sep != ',' {
+            return Failure(p.mismatch(s"',' or '${string(close)}'"))
+        }
+        p.pos = p.pos + 1
+    }
 }
 
-func (p *jsonParser) readEscape(sb *strings.Builder) {
-    if p.pos >= p.data.ByteSize() {
-        go_builtins.Panic("json: unterminated escape sequence")
+// parseField parses one `"key": value` member of an object, skipping leading whitespace.
+// depth: the nesting depth of the enclosing object.
+func (p *jsonParser) parseField(depth int) Try[JField] {
+    p.skipWs()
+    if p.peek() != '"' {
+        return Failure(p.mismatch("string key"))
+    }
+    bind key = p.parseString()
+    p.skipWs()
+    if p.peek() != ':' {
+        return Failure(p.mismatch("':'"))
+    }
+    p.pos = p.pos + 1
+    bind value = p.parseValue(depth)
+    Success(JField(key, value))
+}
+
+// parseString parses a string literal; the cursor is on its opening quote.
+// Unescaped control characters and invalid UTF-8 are rejected (RFC 8259 §7, §8.1).
+func (p *jsonParser) parseString() Try[string] {
+    p.pos = p.pos + 1
+    var sb strings.Builder
+    var runStart = p.pos
+    for !p.atEnd() {
+        val c = p.data[p.pos]
+        if c == '"' {
+            sb.Write(go_interop.Slice(p.data, runStart, p.pos))
+            p.pos = p.pos + 1
+            return Success(sb.String())
+        } else if c == '\\' {
+            sb.Write(go_interop.Slice(p.data, runStart, p.pos))
+            p.pos = p.pos + 1
+            p.readEscape() match {
+                case Success(r) => { sb.WriteRune(r) }
+                case Failure(e) => { return Failure(e) }
+            }
+            runStart = p.pos
+        } else if c < 0x20 {
+            return Failure(JsonSyntaxError(f"unescaped control character 0x${c}%02x in string", p.pos))
+        } else if c < utf8.RuneSelf {
+            p.pos = p.pos + 1
+        } else {
+            val (r, size) = utf8.DecodeRune(go_interop.SliceFrom(p.data, p.pos))
+            if r == utf8.RuneError && size == 1 {
+                return Failure(JsonSyntaxError("invalid UTF-8 in string", p.pos))
+            }
+            p.pos = p.pos + size
+        }
+    }
+    Failure(p.mismatch("'\"'"))
+}
+
+// readEscape decodes one escape sequence; the cursor is just past its backslash.
+func (p *jsonParser) readEscape() Try[rune] {
+    val backslash = p.pos - 1
+    if p.atEnd() {
+        return Failure(p.mismatch("escape sequence"))
     }
     val e = p.data[p.pos]
     p.pos = p.pos + 1
-    if e == '"' {
-        sb.WriteByte(e)
-    } else if e == '\\' {
-        sb.WriteByte(e)
-    } else if e == '/' {
-        sb.WriteByte(e)
-    } else if e == 'n' {
-        sb.WriteByte('\n')
-    } else if e == 't' {
-        sb.WriteByte('\t')
-    } else if e == 'r' {
-        sb.WriteByte('\r')
-    } else if e == 'b' {
-        sb.WriteByte('\b')
-    } else if e == 'f' {
-        sb.WriteByte('\f')
-    } else if e == 'u' {
-        if p.pos + 4 > p.data.ByteSize() {
-            go_builtins.Panic("json: incomplete \\u escape")
-        }
-        var hex = ""
-        var k = 0
-        for k < 4 {
-            hex = hex + string(p.data[p.pos])
-            p.pos = p.pos + 1
-            k = k + 1
-        }
-        val cp, err = strconv.ParseInt(hex, 16, 32)
-        if err != nil {
-            go_builtins.Panic(s"json: invalid \\u escape ${hex}")
-        }
-        sb.WriteRune(rune(cp))
-    } else {
-        go_builtins.Panic("json: invalid escape sequence")
+    e match {
+        case '"' => Success('"')
+        case '\\' => Success('\\')
+        case '/' => Success('/')
+        case 'b' => Success('\b')
+        case 'f' => Success('\f')
+        case 'n' => Success('\n')
+        case 'r' => Success('\r')
+        case 't' => Success('\t')
+        case 'u' => p.readUnicodeEscape()
+        case _ => Failure(JsonSyntaxError("invalid escape sequence", backslash))
     }
 }
 
-func (p *jsonParser) parseNumber() float64 {
-    p.skipWs()
+// readUnicodeEscape decodes the hex digits of a \u escape. A UTF-16 surrogate
+// pair spelled as two escapes joins into one code point; a surrogate without
+// its partner decodes as U+FFFD.
+func (p *jsonParser) readUnicodeEscape() Try[rune] {
+    bind r = p.readHex4()
+    Success(if (utf16.IsSurrogate(r)) p.joinSurrogate(r) else r)
+}
+
+// joinSurrogate pairs the surrogate first with a directly following \u escape,
+// consuming that escape when the two form a valid pair. Otherwise it consumes
+// nothing and returns U+FFFD; whatever follows is then parsed on its own.
+func (p *jsonParser) joinSurrogate(first rune) rune {
     val start = p.pos
-    for p.pos < p.data.ByteSize() {
-        val c = p.data[p.pos]
-        if (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' {
-            p.pos = p.pos + 1
-        } else {
-            break
+    if p.pos + 1 < p.data.Size() && p.data[p.pos] == '\\' && p.data[p.pos + 1] == 'u' {
+        p.pos = p.pos + 2
+        val joined = p.readHex4().Map((second) => utf16.DecodeRune(first, second)).GetOrElse(utf8.RuneError)
+        if joined != utf8.RuneError {
+            return joined
         }
     }
-    if p.pos == start {
-        go_builtins.Panic(s"json: expected number at position ${p.pos}")
-    }
-    var nb strings.Builder
-    var k = start
-    for k < p.pos {
-        nb.WriteByte(p.data[k])
-        k = k + 1
-    }
-    val numStr = nb.String()
-    val v, err = strconv.ParseFloat(numStr, 64)
-    if err != nil {
-        go_builtins.Panic(s"json: invalid number ${numStr}")
-    }
-    return v
+    p.pos = start
+    utf8.RuneError
 }
 
-func (p *jsonParser) parseBool() bool {
-    if p.matchLiteral("true") { return true }
-    if p.matchLiteral("false") { return false }
-    go_builtins.Panic(s"json: expected boolean at position ${p.pos}")
+// readHex4 consumes exactly four hex digits — no sign, no prefix — as a code unit.
+func (p *jsonParser) readHex4() Try[rune] {
+    bind hex = p.expectRun(4, "hex digit", (_, c) => isHexDigit(c))
+    strconv.ParseUint(hex, 16, 32).Map((u) => rune(u))
 }
 
-func (p *jsonParser) parseNull() {
-    if p.matchLiteral("null") { return }
-    go_builtins.Panic(s"json: expected null at position ${p.pos}")
-}
-
-func (p *jsonParser) matchLiteral(lit string) bool {
-    val n = lit.ByteSize()
-    if p.pos + n > p.data.ByteSize() { return false }
-    var k = 0
-    for k < n {
-        if p.data[p.pos + k] != lit[k] { return false }
-        k = k + 1
+// parseNumber parses an RFC 8259 number:
+// -? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?
+func (p *jsonParser) parseNumber() Try[JsonValue] {
+    val start = p.pos
+    if p.peek() == '-' {
+        p.pos = p.pos + 1
     }
-    p.pos = p.pos + n
-    return true
-}
-
-// expect consumes the next non-whitespace byte, requiring it to equal ch.
-func (p *jsonParser) expect(ch byte) {
-    val c = p.nextToken()
-    if c != ch {
-        go_builtins.Panic(s"json: expected '${string(ch)}' at position ${p.pos}")
+    if p.peek() == '0' {
+        p.pos = p.pos + 1
+    } else if !p.skipDigits() {
+        return Failure(p.mismatch("digit"))
+    }
+    if p.peek() == '.' {
+        p.pos = p.pos + 1
+        if !p.skipDigits() {
+            return Failure(p.mismatch("digit"))
+        }
+    }
+    if p.peek() == 'e' || p.peek() == 'E' {
+        p.pos = p.pos + 1
+        if p.peek() == '+' || p.peek() == '-' {
+            p.pos = p.pos + 1
+        }
+        if !p.skipDigits() {
+            return Failure(p.mismatch("digit"))
+        }
+    }
+    // The grammar is already checked, so the only failure left is overflow.
+    strconv.ParseFloat(p.textFrom(start), 64) match {
+        case Success(n) => Success(JNum(n))
+        case Failure(_) => Failure(JsonSyntaxError("number out of range", start))
     }
 }
 
-// peek returns the next non-whitespace byte without consuming it (0 at EOF).
-func (p *jsonParser) peek() byte {
-    p.skipWs()
-    if p.pos >= p.data.ByteSize() {
-        go_builtins.Panic("json: unexpected end of input")
+// skipDigits consumes a run of decimal digits, reporting whether it found any.
+func (p *jsonParser) skipDigits() bool {
+    val start = p.pos
+    p.skipWhile(isDigit)
+    p.pos > start
+}
+
+// parseLiteral consumes the keyword lit and yields v.
+func (p *jsonParser) parseLiteral(lit string, v JsonValue) Try[JsonValue] =
+    p.expectRun(lit.ByteSize(), s"'$lit'", (i, c) => c == lit[i]).Map((_) => v)
+
+// expectRun consumes the next n bytes and returns them when ok holds for each
+// one. Otherwise it fails with the cursor on the first byte that does not
+// match, or at the end of input.
+// n: the length of the run in bytes.
+// want: a description of the expected token, for the error.
+// ok: tests the byte at offset i of the run.
+func (p *jsonParser) expectRun(n int, want string, ok func(int, byte) bool) Try[string] {
+    val start = p.pos
+    // An index loop, like skipWhile's, keeps this per-token path allocation-free.
+    for p.pos < start + n {
+        if p.atEnd() || !ok(p.pos - start, p.data[p.pos]) {
+            return Failure(p.mismatch(want))
+        }
+        p.pos = p.pos + 1
     }
-    return p.data[p.pos]
+    Success(p.textFrom(start))
 }
 
-// nextToken consumes and returns the next non-whitespace byte (0 at EOF).
-func (p *jsonParser) nextToken() byte {
-    p.skipWs()
-    if p.pos >= p.data.ByteSize() { return byte(0) }
-    val c = p.data[p.pos]
-    p.pos = p.pos + 1
-    return c
+// skipWhile advances the cursor past the run of bytes for which pred holds.
+func (p *jsonParser) skipWhile(pred func(byte) bool) {
+    // Per-token hot path: an index loop allocates nothing, where a stream
+    // search would allocate for every byte.
+    for !p.atEnd() && pred(p.data[p.pos]) {
+        p.pos = p.pos + 1
+    }
 }
 
+// textFrom returns the input bytes from start up to the cursor as a string.
+func (p *jsonParser) textFrom(start int) string = go_interop.ToString(go_interop.Slice(p.data, start, p.pos))
+
+// mismatch is the error for a cursor not on what the grammar wants:
+// "unexpected end of input" when the input ran out, else the offending byte.
+// want: a description of the expected token.
+func (p *jsonParser) mismatch(want string) JsonSyntaxError =
+    if (p.atEnd()) JsonSyntaxError("unexpected end of input", p.pos)
+    else JsonSyntaxError(s"expected $want, found ${describeByte(p.data[p.pos])}", p.pos)
+
+// atEnd reports whether the cursor has consumed the whole input.
+func (p *jsonParser) atEnd() bool = p.pos >= p.data.Size()
+
+// peek returns the byte under the cursor without consuming it, or 0 at end of
+// input. A NUL byte is never valid outside a string, so callers only need
+// atEnd to tell the two apart when reporting an error.
+func (p *jsonParser) peek() byte = if (p.atEnd()) byte(0) else p.data[p.pos]
+
+// skipWs advances the cursor past JSON whitespace (RFC 8259 §2).
 func (p *jsonParser) skipWs() {
-    for p.pos < p.data.ByteSize() {
-        val c = p.data[p.pos]
-        if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-            p.pos = p.pos + 1
-        } else {
-            return
-        }
-    }
+    p.skipWhile((c) => c == ' ' || c == '\t' || c == '\n' || c == '\r')
 }
 
-// --- Serializer helpers ---
+func isDigit(c byte) bool = c >= '0' && c <= '9'
 
-func escapeString(s string) string {
-    var sb strings.Builder
-    sb.WriteByte('"')
-    var i = 0
-    for i < s.ByteSize() {
-        val c = s[i]
-        if c == '"' {
-            sb.WriteString("\\\"")
-        } else if c == '\\' {
-            sb.WriteString("\\\\")
-        } else if c == '\n' {
-            sb.WriteString("\\n")
-        } else if c == '\r' {
-            sb.WriteString("\\r")
-        } else if c == '\t' {
-            sb.WriteString("\\t")
-        } else if c < 32 {
-            sb.WriteString("\\u" + hex4(c))
-        } else {
-            sb.WriteByte(c)
-        }
-        i = i + 1
-    }
-    sb.WriteByte('"')
-    return sb.String()
-}
+func isHexDigit(c byte) bool = isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 
-// hex4 renders a control byte (< 32) as a 4-digit lowercase hex escape body.
-func hex4(c byte) string {
-    val digits = "0123456789abcdef"
-    val hi = string(digits[(c >> 4) & 15])
-    val lo = string(digits[c & 15])
-    return "00" + hi + lo
-}
+// describeByte names a byte for an error message: quoted when printable ASCII, else in hex.
+func describeByte(c byte) string = if (c >= 0x20 && c < 0x7f) s"'${string(c)}'" else f"0x${c}%02x"
