@@ -23,12 +23,15 @@ gala mod add github.com/martianoff/gala-mcp
 ## Usage
 
 A server is built by registering tools and calling `Run()`, which serves over stdio until EOF
-(or until reading stdin or writing stdout fails):
+(or until reading stdin or writing stdout fails, which it returns as a `Failure`):
 
 ```gala
 package main
 
-import . "github.com/martianoff/gala-mcp"
+import (
+    "os"
+    . "github.com/martianoff/gala-mcp"
+)
 
 // The handler's argument is the tool call's `arguments` object.
 func greet(args JsonValue) ToolResult {
@@ -50,6 +53,7 @@ func main() {
             Handler = greet,
         ))
         .Run()
+        .OnFailure((_) => os.Exit(1)) // the client is gone; Run logged why
 }
 ```
 

@@ -7,8 +7,10 @@ import (
     "io"
     "math"
     "os"
+    "os/signal"
     "strconv"
     "strings"
+    "syscall"
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/go_interop"
 )
@@ -52,10 +54,15 @@ func (s Server) WithTool(t Tool) Server = s.Copy(Tools = s.Tools.Append(t))
 // written as one line. If reading stdin or writing stdout fails, the client
 // is gone: Run logs the error to stderr, stops serving and returns it as a
 // Failure.
-func (s Server) Run() Try[Void] =
+//
+// Run ignores SIGPIPE for the whole process: otherwise, on Unix, writing to a
+// stdout whose reader has gone kills the process before the error is seen.
+func (s Server) Run() Try[Void] {
+    signal.Ignore(syscall.SIGPIPE)
     s.serve(os.Stdin, os.Stdout).OnFailure((err) => {
         fmt.Fprintln(os.Stderr, s"mcp: stopped serving: ${strconv.Quote(err.Error())}")
     })
+}
 
 // serve is Run over an arbitrary reader and writer, without the logging.
 func (s Server) serve(in io.Reader, out io.Writer) Try[Void] {
@@ -123,7 +130,10 @@ func endOfLine(line *bytes.Buffer, size int, err error) frame {
     if (size > maxLine) {
         return OversizedFrame()
     }
-    if (err == io.EOF && line.Len() == 0) EndFrame(Success(Void())) else LineFrame(line.String())
+    if (err == io.EOF && line.Len() == 0) {
+        return EndFrame(Success(Void()))
+    }
+    LineFrame(strings.TrimSuffix(line.String(), "\n"))
 }
 
 // HandleLine processes a single raw input line and returns the response line
@@ -159,13 +169,26 @@ func (s Server) respond(message JsonValue) Option[string] =
 
 // answer validates a message and carries it out. A notification is carried
 // out like any request, but its response, success or error, is dropped.
-func (s Server) answer(message JsonValue) Option[string] = parseRequest(message) match {
-    case Left(rejection) => Some(RenderJson(rejection))
-    case Right(req) => {
-        val resp = s.dispatch(req)
-        req.Id.Map((_) => RenderJson(resp))
+// A JSON-RPC response (this server sends no requests, so it is stray) is
+// dropped too: answering it could fail a request of the client's own.
+func (s Server) answer(message JsonValue) Option[string] {
+    if (isResponse(message)) {
+        return None()
+    }
+    parseRequest(message) match {
+        case Left(rejection) => Some(RenderJson(rejection))
+        case Right(req) => {
+            val resp = s.dispatch(req)
+            req.Id.Map((_) => RenderJson(resp))
+        }
     }
 }
+
+// isResponse reports whether message is a JSON-RPC response object: it has a
+// result or an error, and no method.
+func isResponse(message JsonValue) bool =
+    message.Get("method").IsEmpty() &&
+        (message.Get("result").IsDefined() || message.Get("error").IsDefined())
 
 // internalError logs a panic raised while handling a request to stderr and
 // answers it with a JSON-RPC internal error for id — or with nothing when id
@@ -196,7 +219,8 @@ func invalidRequest(id JsonValue, reason string) JsonValue = errorResponse(id, C
 // checkRequest validates the members of a Request object.
 func checkRequest(message JsonValue) Either[JsonValue, request] {
     val id = message.Get("id")
-    val params = message.Get("params").GetOrElse(JObjOf())
+    // A null params is taken as no params, as some clients send it.
+    val params = message.Get("params").Filter((p) => !p.IsNull()).GetOrElse(JObjOf())
     val reject = (reason string) => Left[JsonValue, request](
         invalidRequest(replyId(message).GetOrElse(JNull()), reason),
     )
@@ -219,11 +243,16 @@ func checkRequest(message JsonValue) Either[JsonValue, request] {
 func replyId(message JsonValue) Option[JsonValue] =
     message.Get("id").Map((id) => if (isValidId(id)) id else JNull())
 
+// maxExactId is the largest integer id a JSON number (a float64) holds
+// exactly, and so can be echoed back unchanged.
+val maxExactId = float64(1 << 53 - 1)
+
 // isValidId reports whether id is a valid MCP request id: a string or an
-// integer. Unlike plain JSON-RPC 2.0, MCP does not allow a null id.
+// integer. Unlike plain JSON-RPC 2.0, MCP does not allow a null id. An integer
+// beyond maxExactId is rejected, since its echo would not match.
 func isValidId(id JsonValue) bool = id match {
     case JStr(_) => true
-    case JNum(n) => n == math.Trunc(n)
+    case JNum(n) => n == math.Trunc(n) && math.Abs(n) <= maxExactId
     case _ => false
 }
 

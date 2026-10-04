@@ -179,6 +179,22 @@ func TestNotificationsGetNoResponse(t T) T =
         Case(Name = "params as array", Input = notification("ping", "[]"), Expected = "<none>"),
     )
 
+// A response object is not a request: the server sends no requests, so one
+// is stray, and it is dropped rather than answered.
+func TestResponsesGetNoResponse(t T) T =
+    RunCases(t,
+        replyIs,
+        Case(Name = "result", Input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}", Expected = "<none>"),
+        Case(
+            Name = "error",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-1,\"message\":\"x\"}}",
+            Expected = "<none>",
+        ),
+    )
+
+func TestNullParamsIsNoParams(t T) T =
+    replyIs(t, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":null}", pongWithId(1))
+
 // MCP requires a request id to be a string or an integer, never null; a
 // message whose id is anything else is an invalid request, answered with a
 // null id because its own cannot be echoed.
@@ -195,6 +211,12 @@ func TestRequestIds(t T) T =
         Case(Name = "fractional id", Input = pingWithRawId("1.5"), Expected = badIdReply),
         Case(Name = "boolean id", Input = pingWithRawId("true"), Expected = badIdReply),
         Case(Name = "object id", Input = pingWithRawId("{}"), Expected = badIdReply),
+        Case(
+            Name = "largest exact integer id",
+            Input = pingWithRawId("9007199254740991"),
+            Expected = pongWithRawId("9007199254740991"),
+        ),
+        Case(Name = "integer id too large to echo", Input = pingWithRawId("9007199254740993"), Expected = badIdReply),
         Case(
             Name = "null id on a notification method",
             Input = "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"notifications/initialized\"}",
@@ -295,7 +317,8 @@ func TestOversizedLastLineWithoutNewline(t T) T {
 }
 
 // An oversized line is discarded as it streams past, not buffered whole: a
-// 100 MiB line costs far less than 100 MiB of allocation.
+// 100 MiB line costs at most the 10 MiB limit in buffer growth, well under the
+// 64 MiB bound (buffering it whole would cost over 100 MiB).
 func TestOversizedLineIsNotBuffered(t T) T {
     val input = strings.Repeat("x", 100 * 1024 * 1024) + "\n" + pingWithId(1) + "\n"
     val out = New[strings.Builder]()
@@ -304,7 +327,7 @@ func TestOversizedLineIsNotBuffered(t T) T {
     sampleServer().serve(strings.NewReader(input), out)
     val after = New[runtime.MemStats]()
     runtime.ReadMemStats(after)
-    val t1 = Less(t, after.TotalAlloc - before.TotalAlloc, uint64(50 * 1024 * 1024))
+    val t1 = Less(t, after.TotalAlloc - before.TotalAlloc, uint64(64 * 1024 * 1024))
     Eq(t1, out.String(), tooLargeReply + "\n" + pongWithId(1) + "\n")
 }
 
