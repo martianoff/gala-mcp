@@ -154,6 +154,11 @@ func TestParseDepthLimit(t T) T {
             Input = nested("[{\"k\":", "}]", MaxJsonDepth / 2 + 1),
             Expected = "json: nesting deeper than 512 levels at position 1536",
         ),
+        Case[string, string](
+            Name = "far over the limit",
+            Input = nested("[", "]", 1000000),
+            Expected = "json: nesting deeper than 512 levels at position 512",
+        ),
     )
 }
 
