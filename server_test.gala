@@ -184,7 +184,11 @@ func TestNotificationsGetNoResponse(t T) T =
 func TestResponsesGetNoResponse(t T) T =
     RunCases(t,
         replyIs,
-        Case(Name = "result", Input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}", Expected = "<none>"),
+        Case(
+            Name = "result",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            Expected = "<none>",
+        ),
         Case(
             Name = "error",
             Input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-1,\"message\":\"x\"}}",
@@ -216,7 +220,11 @@ func TestRequestIds(t T) T =
             Input = pingWithRawId("9007199254740991"),
             Expected = pongWithRawId("9007199254740991"),
         ),
-        Case(Name = "integer id too large to echo", Input = pingWithRawId("9007199254740993"), Expected = badIdReply),
+        Case(
+            Name = "integer id too large to echo",
+            Input = pingWithRawId("9007199254740993"),
+            Expected = badIdReply,
+        ),
         Case(
             Name = "null id on a notification method",
             Input = "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"notifications/initialized\"}",
