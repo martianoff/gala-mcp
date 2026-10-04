@@ -1,6 +1,7 @@
 package mcp
 
 import (
+    "martianoff/gala/go_builtins"
     "strconv"
     "strings"
     . "martianoff/gala/collection_immutable"
@@ -12,8 +13,8 @@ func ParseJson(input string) Try[JsonValue] = Try[JsonValue](() => {
     val p = &jsonParser{data: input, pos: 0}
     val v = p.parseValue()
     p.skipWs()
-    if p.pos < len(p.data) {
-        panic(s"json: trailing data at position ${p.pos}")
+    if p.pos < p.data.ByteSize() {
+        go_builtins.Panic(s"json: trailing data at position ${p.pos}")
     }
     return v
 })
@@ -69,7 +70,7 @@ func (p *jsonParser) parseObject() JsonValue {
         } else if sep == '}' {
             more = false
         } else {
-            panic(s"json: expected ',' or '}' at position ${p.pos}")
+            go_builtins.Panic(s"json: expected ',' or '}' at position ${p.pos}")
         }
     }
     return JObj(fields)
@@ -91,7 +92,7 @@ func (p *jsonParser) parseArray() JsonValue {
         } else if sep == ']' {
             more = false
         } else {
-            panic(s"json: expected ',' or ']' at position ${p.pos}")
+            go_builtins.Panic(s"json: expected ',' or ']' at position ${p.pos}")
         }
     }
     return JArr(items)
@@ -99,12 +100,12 @@ func (p *jsonParser) parseArray() JsonValue {
 
 func (p *jsonParser) parseString() string {
     p.skipWs()
-    if p.pos >= len(p.data) || p.data[p.pos] != '"' {
-        panic(s"json: expected string at position ${p.pos}")
+    if p.pos >= p.data.ByteSize() || p.data[p.pos] != '"' {
+        go_builtins.Panic(s"json: expected string at position ${p.pos}")
     }
     p.pos = p.pos + 1
     var sb strings.Builder
-    for p.pos < len(p.data) {
+    for p.pos < p.data.ByteSize() {
         val c = p.data[p.pos]
         if c == '"' {
             p.pos = p.pos + 1
@@ -118,12 +119,12 @@ func (p *jsonParser) parseString() string {
             p.pos = p.pos + 1
         }
     }
-    panic("json: unterminated string")
+    go_builtins.Panic("json: unterminated string")
 }
 
 func (p *jsonParser) readEscape(sb *strings.Builder) {
-    if p.pos >= len(p.data) {
-        panic("json: unterminated escape sequence")
+    if p.pos >= p.data.ByteSize() {
+        go_builtins.Panic("json: unterminated escape sequence")
     }
     val e = p.data[p.pos]
     p.pos = p.pos + 1
@@ -144,8 +145,8 @@ func (p *jsonParser) readEscape(sb *strings.Builder) {
     } else if e == 'f' {
         sb.WriteByte('\f')
     } else if e == 'u' {
-        if p.pos + 4 > len(p.data) {
-            panic("json: incomplete \\u escape")
+        if p.pos + 4 > p.data.ByteSize() {
+            go_builtins.Panic("json: incomplete \\u escape")
         }
         var hex = ""
         var k = 0
@@ -156,18 +157,18 @@ func (p *jsonParser) readEscape(sb *strings.Builder) {
         }
         val cp, err = strconv.ParseInt(hex, 16, 32)
         if err != nil {
-            panic(s"json: invalid \\u escape ${hex}")
+            go_builtins.Panic(s"json: invalid \\u escape ${hex}")
         }
         sb.WriteRune(rune(cp))
     } else {
-        panic("json: invalid escape sequence")
+        go_builtins.Panic("json: invalid escape sequence")
     }
 }
 
 func (p *jsonParser) parseNumber() float64 {
     p.skipWs()
     val start = p.pos
-    for p.pos < len(p.data) {
+    for p.pos < p.data.ByteSize() {
         val c = p.data[p.pos]
         if (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' {
             p.pos = p.pos + 1
@@ -176,7 +177,7 @@ func (p *jsonParser) parseNumber() float64 {
         }
     }
     if p.pos == start {
-        panic(s"json: expected number at position ${p.pos}")
+        go_builtins.Panic(s"json: expected number at position ${p.pos}")
     }
     var nb strings.Builder
     var k = start
@@ -187,7 +188,7 @@ func (p *jsonParser) parseNumber() float64 {
     val numStr = nb.String()
     val v, err = strconv.ParseFloat(numStr, 64)
     if err != nil {
-        panic(s"json: invalid number ${numStr}")
+        go_builtins.Panic(s"json: invalid number ${numStr}")
     }
     return v
 }
@@ -195,17 +196,17 @@ func (p *jsonParser) parseNumber() float64 {
 func (p *jsonParser) parseBool() bool {
     if p.matchLiteral("true") { return true }
     if p.matchLiteral("false") { return false }
-    panic(s"json: expected boolean at position ${p.pos}")
+    go_builtins.Panic(s"json: expected boolean at position ${p.pos}")
 }
 
 func (p *jsonParser) parseNull() {
     if p.matchLiteral("null") { return }
-    panic(s"json: expected null at position ${p.pos}")
+    go_builtins.Panic(s"json: expected null at position ${p.pos}")
 }
 
 func (p *jsonParser) matchLiteral(lit string) bool {
-    val n = len(lit)
-    if p.pos + n > len(p.data) { return false }
+    val n = lit.ByteSize()
+    if p.pos + n > p.data.ByteSize() { return false }
     var k = 0
     for k < n {
         if p.data[p.pos + k] != lit[k] { return false }
@@ -219,15 +220,15 @@ func (p *jsonParser) matchLiteral(lit string) bool {
 func (p *jsonParser) expect(ch byte) {
     val c = p.nextToken()
     if c != ch {
-        panic(s"json: expected '${string(ch)}' at position ${p.pos}")
+        go_builtins.Panic(s"json: expected '${string(ch)}' at position ${p.pos}")
     }
 }
 
 // peek returns the next non-whitespace byte without consuming it (0 at EOF).
 func (p *jsonParser) peek() byte {
     p.skipWs()
-    if p.pos >= len(p.data) {
-        panic("json: unexpected end of input")
+    if p.pos >= p.data.ByteSize() {
+        go_builtins.Panic("json: unexpected end of input")
     }
     return p.data[p.pos]
 }
@@ -235,14 +236,14 @@ func (p *jsonParser) peek() byte {
 // nextToken consumes and returns the next non-whitespace byte (0 at EOF).
 func (p *jsonParser) nextToken() byte {
     p.skipWs()
-    if p.pos >= len(p.data) { return byte(0) }
+    if p.pos >= p.data.ByteSize() { return byte(0) }
     val c = p.data[p.pos]
     p.pos = p.pos + 1
     return c
 }
 
 func (p *jsonParser) skipWs() {
-    for p.pos < len(p.data) {
+    for p.pos < p.data.ByteSize() {
         val c = p.data[p.pos]
         if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
             p.pos = p.pos + 1
@@ -258,7 +259,7 @@ func escapeString(s string) string {
     var sb strings.Builder
     sb.WriteByte('"')
     var i = 0
-    for i < len(s) {
+    for i < s.ByteSize() {
         val c = s[i]
         if c == '"' {
             sb.WriteString("\\\"")

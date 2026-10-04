@@ -39,6 +39,8 @@ func TestParseRoundTrip(t T) T {
         Case[string, string](Name = "int", Input = "123", Expected = "123"),
         Case[string, string](Name = "neg", Input = "-7", Expected = "-7"),
         Case[string, string](Name = "string", Input = "\"hello\"", Expected = "\"hello\""),
+        Case[string, string](Name = "multibyte", Input = "\"héllo — ✓\"", Expected = "\"héllo — ✓\""),
+        Case[string, string](Name = "unicode escape", Input = "\"caf\\u00e9\"", Expected = "\"café\""),
         Case[string, string](Name = "array", Input = "[1, 2, 3]", Expected = "[1,2,3]"),
         Case[string, string](Name = "object", Input = "{\"a\": 1, \"b\": [true, null]}", Expected = "{\"a\":1,\"b\":[true,null]}"),
         Case[string, string](Name = "nested", Input = "{\"x\": {\"y\": \"z\"}}", Expected = "{\"x\":{\"y\":\"z\"}}"),
