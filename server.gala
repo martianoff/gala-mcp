@@ -55,35 +55,39 @@ func (s Server) serve(in io.Reader, out io.Writer) {
 //
 // A panic while handling the line — in a tool handler or in the server
 // itself — is logged to stderr and answered with a JSON-RPC internal error
-// (or with nothing, for a notification), so one failing request never stops
-// the server.
+// (or with nothing, for a notification), and the server goes on to the next
+// line.
 func (s Server) HandleLine(line string) Option[string] {
     val trimmed = strings.TrimSpace(line)
     if trimmed == "" {
         return None[string]()
     }
-    // Until the line parses its id is unknown, and JSON-RPC 2.0 answers such
-    // an error with a null id.
-    recoverRequest(Some(JNull()), ParseJson(trimmed) match {
-        case Success(request) => recoverRequest(request.Get("id"), s.dispatch(request).Map(RenderJson))
-        case Failure(_) =>
+    // A panic while parsing leaves the id unknown, which JSON-RPC 2.0 answers
+    // with a null id.
+    Try(ParseJson(trimmed)) match {
+        case Success(Success(request)) => s.respond(request)
+        case Success(Failure(_)) =>
             Some(RenderJson(errorResponse(JNull(), CodeParseError, "parse error")))
-    })
+        case Failure(err) => internalError(Some(JNull()), err)
+    }
 }
 
-// recoverRequest is the per-request panic boundary. It returns handle's
-// response; if handle panics, it logs the panic to stderr and instead answers
-// with a JSON-RPC internal error for id — or with nothing when id is None,
-// since a notification never gets a response. The panic value is not sent
-// to the client.
-func recoverRequest(id Option[JsonValue], handle func() Option[string]) Option[string] =
-    Try(handle) match {
+// respond dispatches a parsed request inside the per-request panic boundary
+// and renders the response, if any.
+func (s Server) respond(request JsonValue) Option[string] =
+    Try(s.dispatch(request).Map(RenderJson)) match {
         case Success(resp) => resp
-        case Failure(err) => {
-            fmt.Fprintln(os.Stderr, s"mcp: request handling panicked: $err")
-            id.Map((i) => RenderJson(errorResponse(i, CodeInternalError, "internal error")))
-        }
+        case Failure(err) => internalError(request.Get("id"), err)
     }
+
+// internalError logs a panic raised while handling a request to stderr and
+// answers it with a JSON-RPC internal error for id — or with nothing when id
+// is None, since a notification never gets a response. The panic value is
+// not sent to the client.
+func internalError(id Option[JsonValue], err error) Option[string] {
+    fmt.Fprintln(os.Stderr, s"mcp: request handling panicked: $err")
+    id.Map((i) => RenderJson(errorResponse(i, CodeInternalError, "internal error")))
+}
 
 // dispatch routes a parsed request to its handler, returning None for
 // notifications (requests with no id), which must not produce a response.
