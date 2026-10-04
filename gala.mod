@@ -1,3 +1,3 @@
 module github.com/martianoff/gala-mcp
 
-gala 1.0
+gala 0.84.1
