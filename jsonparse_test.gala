@@ -16,8 +16,8 @@ func outcome(input string) string = ParseJson(input) match {
 func nested(open string, close string, depth int) string =
     strings.Repeat(open, depth) + "0" + strings.Repeat(close, depth)
 
-func TestParseStrings(t T) T {
-    return RunCases[string, string](t,
+func TestParseStrings(t T) T =
+    RunCases[string, string](t,
         (sub T, input string, expected string) => Eq(sub, outcome(input), expected),
         Case[string, string](Name = "raw emoji", Input = "\"😀\"", Expected = "\"😀\""),
         Case[string, string](Name = "surrogate pair", Input = "\"\\ud83d\\ude00\"", Expected = "\"😀\""),
@@ -36,10 +36,9 @@ func TestParseStrings(t T) T {
         Case[string, string](Name = "escaped control char", Input = "\"\\u0001\"", Expected = "\"\\u0001\""),
         Case[string, string](Name = "text around escapes", Input = "\"ab\\ncd\\u00e9ef\"", Expected = "\"ab\\ncdéef\""),
     )
-}
 
-func TestParseNumbers(t T) T {
-    return RunCases[string, string](t,
+func TestParseNumbers(t T) T =
+    RunCases[string, string](t,
         (sub T, input string, expected string) => Eq(sub, outcome(input), expected),
         Case[string, string](Name = "zero", Input = "0", Expected = "0"),
         Case[string, string](Name = "negative zero", Input = "-0", Expected = "-0"),
@@ -58,10 +57,9 @@ func TestParseNumbers(t T) T {
         Case[string, string](Name = "underflow rounds to zero", Input = "1e-400", Expected = "0"),
         Case[string, string](Name = "largest float", Input = "1.7976931348623157e308", Expected = "1.7976931348623157e+308"),
     )
-}
 
-func TestParseRejects(t T) T {
-    return RunCases[string, string](t,
+func TestParseRejects(t T) T =
+    RunCases[string, string](t,
         (sub T, input string, expected string) => Eq(sub, outcome(input), expected),
         // Truncation always reads "unexpected end of input", at the input length.
         Case[string, string](Name = "empty", Input = "", Expected = "json: unexpected end of input at position 0"),
@@ -124,10 +122,9 @@ func TestParseRejects(t T) T {
         Case[string, string](Name = "UTF-8 surrogate", Input = "\"\xed\xa0\x80\"", Expected = "json: invalid UTF-8 in string at position 1"),
         Case[string, string](Name = "overlong UTF-8", Input = "\"\xc0\xaf\"", Expected = "json: invalid UTF-8 in string at position 1"),
     )
-}
 
-func TestParseDepthLimit(t T) T {
-    return RunCases[string, string](t,
+func TestParseDepthLimit(t T) T =
+    RunCases[string, string](t,
         (sub T, input string, expected string) => Eq(sub, outcome(input), expected),
         Case[string, string](
             Name = "arrays at the limit",
@@ -160,18 +157,17 @@ func TestParseDepthLimit(t T) T {
             Expected = "json: nesting deeper than 512 levels at position 512",
         ),
     )
-}
 
 func TestParseErrorIsTyped(t T) T {
     val offset = ParseJson("[1, x]") match {
         case Failure(e: JsonSyntaxError) => e.Offset
         case _ => -1
     }
-    return Eq(t, offset, 4)
+    Eq(t, offset, 4)
 }
 
-func TestRenderNumbers(t T) T {
-    return RunCases[float64, string](t,
+func TestRenderNumbers(t T) T =
+    RunCases[float64, string](t,
         (sub T, input float64, expected string) => Eq(sub, RenderJson(JNum(input)), expected),
         Case[float64, string](Name = "integer", Input = 42.0, Expected = "42"),
         Case[float64, string](Name = "fraction", Input = -2.5, Expected = "-2.5"),
@@ -187,10 +183,9 @@ func TestRenderNumbers(t T) T {
         Case[float64, string](Name = "+Inf", Input = math.Inf(1), Expected = "null"),
         Case[float64, string](Name = "-Inf", Input = math.Inf(-1), Expected = "null"),
     )
-}
 
-func TestRenderStrings(t T) T {
-    return RunCases[string, string](t,
+func TestRenderStrings(t T) T =
+    RunCases[string, string](t,
         (sub T, input string, expected string) => Eq(sub, RenderJson(JStr(input)), expected),
         Case[string, string](Name = "plain", Input = "hi", Expected = "\"hi\""),
         Case[string, string](Name = "quote and backslash", Input = "a\"b\\c", Expected = "\"a\\\"b\\\\c\""),
@@ -199,9 +194,8 @@ func TestRenderStrings(t T) T {
         Case[string, string](Name = "emoji", Input = "😀", Expected = "\"😀\""),
         Case[string, string](Name = "invalid UTF-8", Input = "a\xffb", Expected = "\"a\uFFFDb\""),
     )
-}
 
 func TestRenderedOutputParses(t T) T {
     val v = JArrOf(JNum(math.NaN()), JNum(math.Inf(1)), JNum(1e300), JStr("a\xff"), JStr("\u0001"))
-    return IsSuccess(t, ParseJson(RenderJson(v)))
+    IsSuccess(t, ParseJson(RenderJson(v)))
 }

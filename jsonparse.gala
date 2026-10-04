@@ -8,6 +8,7 @@ import (
     "unicode/utf8"
     "martianoff/gala/go_interop"
     "martianoff/gala/json"
+    "martianoff/gala/stream"
     . "martianoff/gala/collection_immutable"
 )
 
@@ -68,7 +69,7 @@ func renderNumber(n float64) string {
 // string escaper.
 func quote(s string) string {
     val e = json.NewJsonEncoder()
-    e.WriteString(if (utf8.ValidString(s)) s else strings.ToValidUTF8(s, "�"))
+    e.WriteString(if (utf8.ValidString(s)) s else strings.ToValidUTF8(s, "\uFFFD"))
     e.String()
 }
 
@@ -104,27 +105,39 @@ func (p *jsonParser) parseValue(depth int) Try[JsonValue] {
 
 // parseObject parses an object; the cursor is on its '{'.
 // depth: the nesting depth of the object itself.
-func (p *jsonParser) parseObject(depth int) Try[JsonValue] {
+func (p *jsonParser) parseObject(depth int) Try[JsonValue] =
+    parseSeq(p, '}', () => p.parseField(depth)).Map((fields) => JObj(fields))
+
+// parseArray parses an array; the cursor is on its '['.
+// depth: the nesting depth of the array itself.
+func (p *jsonParser) parseArray(depth int) Try[JsonValue] =
+    parseSeq(p, ']', () => p.parseValue(depth)).Map((items) => JArr(items))
+
+// parseSeq parses the comma-separated elements of an array or object; the
+// cursor is on its opening bracket.
+// close: the closing bracket.
+// elem: parses one element.
+func parseSeq[E any](p *jsonParser, close byte, elem func() Try[E]) Try[Array[E]] {
     p.pos = p.pos + 1
-    var fields = EmptyArray[JField]()
     p.skipWs()
-    if p.peek() == '}' {
+    if p.peek() == close {
         p.pos = p.pos + 1
-        return Success(JObj(fields))
+        return Success(EmptyArray[E]())
     }
+    var items = EmptyArray[E]()
     for {
-        p.parseField(depth) match {
-            case Success(f) => { fields = fields.Append(f) }
+        elem() match {
+            case Success(it) => { items = items.Append(it) }
             case Failure(e) => { return Failure(e) }
         }
         p.skipWs()
         val sep = p.peek()
-        if sep == '}' {
+        if sep == close {
             p.pos = p.pos + 1
-            return Success(JObj(fields))
+            return Success(items)
         }
         if sep != ',' {
-            return Failure(p.mismatch("',' or '}'"))
+            return Failure(p.mismatch(s"',' or '${string(close)}'"))
         }
         p.pos = p.pos + 1
     }
@@ -145,34 +158,6 @@ func (p *jsonParser) parseField(depth int) Try[JField] {
     p.pos = p.pos + 1
     bind value = p.parseValue(depth)
     Success(JField(key, value))
-}
-
-// parseArray parses an array; the cursor is on its '['.
-// depth: the nesting depth of the array itself.
-func (p *jsonParser) parseArray(depth int) Try[JsonValue] {
-    p.pos = p.pos + 1
-    var items = EmptyArray[JsonValue]()
-    p.skipWs()
-    if p.peek() == ']' {
-        p.pos = p.pos + 1
-        return Success(JArr(items))
-    }
-    for {
-        p.parseValue(depth) match {
-            case Success(v) => { items = items.Append(v) }
-            case Failure(e) => { return Failure(e) }
-        }
-        p.skipWs()
-        val sep = p.peek()
-        if sep == ']' {
-            p.pos = p.pos + 1
-            return Success(JArr(items))
-        }
-        if sep != ',' {
-            return Failure(p.mismatch("',' or ']'"))
-        }
-        p.pos = p.pos + 1
-    }
 }
 
 // parseString parses a string literal; the cursor is on its opening quote.
@@ -257,16 +242,8 @@ func (p *jsonParser) joinSurrogate(first rune) rune {
 
 // readHex4 consumes exactly four hex digits — no sign, no prefix — as a code unit.
 func (p *jsonParser) readHex4() Try[rune] {
-    var r = 0
-    for i := 0; i < 4; i++ {
-        val d = hexDigit(p.peek())
-        if d < 0 {
-            return Failure(p.mismatch("hex digit"))
-        }
-        r = r * 16 + d
-        p.pos = p.pos + 1
-    }
-    Success(rune(r))
+    bind hex = p.expectRun(4, "hex digit", (_, c) => isHexDigit(c))
+    strconv.ParseUint(hex, 16, 32).Map((u) => rune(u))
 }
 
 // parseNumber parses an RFC 8259 number:
@@ -306,21 +283,38 @@ func (p *jsonParser) parseNumber() Try[JsonValue] {
 // skipDigits consumes a run of decimal digits, reporting whether it found any.
 func (p *jsonParser) skipDigits() bool {
     val start = p.pos
-    for isDigit(p.peek()) {
-        p.pos = p.pos + 1
-    }
+    p.skipWhile(isDigit)
     p.pos > start
 }
 
 // parseLiteral consumes the keyword lit and yields v.
-func (p *jsonParser) parseLiteral(lit string, v JsonValue) Try[JsonValue] {
-    for i := 0; i < lit.ByteSize(); i++ {
-        if p.peek() != lit[i] {
-            return Failure(p.mismatch(s"'$lit'"))
+func (p *jsonParser) parseLiteral(lit string, v JsonValue) Try[JsonValue] =
+    p.expectRun(lit.ByteSize(), s"'$lit'", (i, c) => c == lit[i]).Map((_) => v)
+
+// expectRun consumes the next n bytes and returns them when ok holds for each
+// one. Otherwise it fails with the cursor on the first byte that does not
+// match, or at the end of input.
+// n: the length of the run in bytes.
+// want: a description of the expected token, for the error.
+// ok: tests the byte at offset i of the run.
+func (p *jsonParser) expectRun(n int, want string, ok func(int, byte) bool) Try[string] {
+    val start = p.pos
+    stream.Range(start, start + n).Find((i) => i >= p.data.Size() || !ok(i - start, p.data[i])) match {
+        case Some(bad) => {
+            p.pos = bad
+            Failure(p.mismatch(want))
         }
-        p.pos = p.pos + 1
+        case None() => {
+            p.pos = start + n
+            Success(go_interop.ToString(go_interop.Slice(p.data, start, p.pos)))
+        }
     }
-    Success(v)
+}
+
+// skipWhile advances the cursor past the run of bytes for which pred holds.
+func (p *jsonParser) skipWhile(pred func(byte) bool) {
+    val end = p.data.Size()
+    p.pos = stream.Range(p.pos, end).Find((i) => !pred(p.data[i])).GetOrElse(end)
 }
 
 // mismatch is the error for a cursor not on what the grammar wants:
@@ -338,21 +332,14 @@ func (p *jsonParser) atEnd() bool = p.pos >= p.data.Size()
 // atEnd to tell the two apart when reporting an error.
 func (p *jsonParser) peek() byte = if (p.atEnd()) byte(0) else p.data[p.pos]
 
+// skipWs advances the cursor past JSON whitespace (RFC 8259 §2).
 func (p *jsonParser) skipWs() {
-    for p.peek() == ' ' || p.peek() == '\t' || p.peek() == '\n' || p.peek() == '\r' {
-        p.pos = p.pos + 1
-    }
+    p.skipWhile((c) => c == ' ' || c == '\t' || c == '\n' || c == '\r')
 }
 
 func isDigit(c byte) bool = c >= '0' && c <= '9'
 
-// hexDigit returns the value of the hex digit c, or -1 when c is not one.
-func hexDigit(c byte) int = c match {
-    case _ if isDigit(c) => int(c - '0')
-    case _ if c >= 'a' && c <= 'f' => int(c - 'a') + 10
-    case _ if c >= 'A' && c <= 'F' => int(c - 'A') + 10
-    case _ => -1
-}
+func isHexDigit(c byte) bool = isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 
 // describeByte names a byte for an error message: quoted when printable ASCII, else in hex.
 func describeByte(c byte) string = if (c >= 0x20 && c < 0x7f) s"'${string(c)}'" else f"0x${c}%02x"
