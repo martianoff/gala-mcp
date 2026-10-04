@@ -64,9 +64,8 @@ func (s Server) HandleLine(line string) Option[string] {
     }
     // Until the line parses its id is unknown, and JSON-RPC 2.0 answers such
     // an error with a null id.
-    return recoverRequest(Some(JNull()), () => ParseJson(trimmed) match {
-        case Success(request) =>
-            recoverRequest(request.Get("id"), () => s.dispatch(request).Map((resp) => RenderJson(resp)))
+    recoverRequest(Some(JNull()), ParseJson(trimmed) match {
+        case Success(request) => recoverRequest(request.Get("id"), s.dispatch(request).Map(RenderJson))
         case Failure(_) =>
             Some(RenderJson(errorResponse(JNull(), CodeParseError, "parse error")))
     })
@@ -78,7 +77,7 @@ func (s Server) HandleLine(line string) Option[string] {
 // since a notification never gets a response. The panic value is not sent
 // to the client.
 func recoverRequest(id Option[JsonValue], handle func() Option[string]) Option[string] =
-    Try(() => handle()) match {
+    Try(handle) match {
         case Success(resp) => resp
         case Failure(err) => {
             fmt.Fprintln(os.Stderr, s"mcp: request handling panicked: $err")

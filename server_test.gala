@@ -109,7 +109,7 @@ val pingRequest = "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}"
 func serveLines(s Server, lines Array[string]) Array[string] {
     val out = New[strings.Builder]()
     s.serve(strings.NewReader(lines.MkString("\n")), out)
-    ArrayFromSlice(strings.Split(out.String(), "\n")).Filter((l) => l != "")
+    ArrayFromSlice(strings.Split(out.String(), "\n")).Filter(_ != "")
 }
 
 func TestPanickingRequestReturnsInternalError(t T) T {
