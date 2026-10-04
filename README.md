@@ -81,7 +81,7 @@ input length when the input ends early, reported as `unexpected end of input`). 
 deeper than `MaxJsonDepth` (512) arrays/objects is rejected. A number outside `float64`'s range
 (`1e400`) is rejected, and one too small to represent (`1e-400`) parses as `0`. A UTF-16
 surrogate escape without its partner (`"\ud83d"`) decodes as U+FFFD, as Go's `encoding/json`
-does.
+does. Duplicate object keys are kept in input order, and `Get` returns the first.
 
 `RenderJson` always produces valid JSON: NaN and ±Inf render as `null` (as `JSON.stringify`
 does), invalid UTF-8 in a string renders as U+FFFD, and numbers use the shortest round-trip
