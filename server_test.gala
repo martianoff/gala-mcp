@@ -234,8 +234,8 @@ func TestRequestIds(t T) T =
 
 val badIdReply = invalidRequestReply("null", "id must be a string or an integer")
 
-// A message that is not a valid Request object is answered even without an
-// id: only a valid request without an id is a notification.
+// A message that is not a valid Request object is answered with -32600 and
+// its id. Without an id it was meant as a notification, and gets nothing.
 func TestInvalidRequestObjects(t T) T =
     RunCases(t,
         replyIs,
@@ -257,8 +257,10 @@ func TestInvalidRequestObjects(t T) T =
         Case(
             Name = "non-string method without id",
             Input = "{\"jsonrpc\":\"2.0\",\"method\":1,\"params\":\"bar\"}",
-            Expected = invalidRequestReply("null", "method must be a string"),
+            Expected = "<none>",
         ),
+        Case(Name = "notification without jsonrpc", Input = "{\"method\":\"ping\"}", Expected = "<none>"),
+        Case(Name = "notification with scalar params", Input = notification("ping", "1"), Expected = "<none>"),
         Case(
             Name = "scalar params",
             Input = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\",\"params\":\"bar\"}",

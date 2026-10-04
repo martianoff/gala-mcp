@@ -3,6 +3,7 @@ package mcp
 import (
     "bufio"
     "bytes"
+    "context"
     "fmt"
     "io"
     "math"
@@ -55,10 +56,13 @@ func (s Server) WithTool(t Tool) Server = s.Copy(Tools = s.Tools.Append(t))
 // is gone: Run logs the error to stderr, stops serving and returns it as a
 // Failure.
 //
-// Run ignores SIGPIPE for the whole process: otherwise, on Unix, writing to a
-// stdout whose reader has gone kills the process before the error is seen.
+// On Unix, a write to a stdout whose reader has gone raises SIGPIPE, which
+// kills a Go process before the write can fail with an error. Run therefore
+// subscribes to SIGPIPE, which makes the write fail instead. Unlike ignoring
+// the signal, this leaves the signal handling of child processes and any
+// other subscriber untouched.
 func (s Server) Run() Try[Void] {
-    signal.Ignore(syscall.SIGPIPE)
+    signal.NotifyContext(context.Background(), syscall.SIGPIPE)
     s.serve(os.Stdin, os.Stdout).OnFailure((err) => {
         fmt.Fprintln(os.Stderr, s"mcp: stopped serving: ${strconv.Quote(err.Error())}")
     })
@@ -110,9 +114,10 @@ func readFrame(r *bufio.Reader) frame {
         val chunk, err = r.ReadSlice(byte('\n'))
         // The chunk that ends a line (err == nil) ends with the newline,
         // which is not part of the message.
-        size = size + (if (err == nil) chunk.Size() - 1 else chunk.Size())
+        val body = if (err == nil) SliceTo(chunk, chunk.Size() - 1) else chunk
+        size = size + body.Size()
         if (size <= maxLine) {
-            line.Write(chunk)
+            line.Write(body)
         }
         if (err != bufio.ErrBufferFull) {
             return endOfLine(line, size, err)
@@ -133,7 +138,7 @@ func endOfLine(line *bytes.Buffer, size int, err error) frame {
     if (err == io.EOF && line.Len() == 0) {
         return EndFrame(Success(Void()))
     }
-    LineFrame(strings.TrimSuffix(line.String(), "\n"))
+    LineFrame(line.String())
 }
 
 // HandleLine processes a single raw input line and returns the response line
@@ -176,7 +181,7 @@ func (s Server) answer(message JsonValue) Option[string] {
         return None()
     }
     parseRequest(message) match {
-        case Left(rejection) => Some(RenderJson(rejection))
+        case Left(rejection) => rejection.Map(RenderJson)
         case Right(req) => {
             val resp = s.dispatch(req)
             req.Id.Map((_) => RenderJson(resp))
@@ -206,23 +211,25 @@ struct request(Id Option[JsonValue], Method string, Params JsonValue)
 
 // parseRequest checks that message is a valid Request object, or returns
 // the -32600 invalid-request response that rejects it. MCP has no batches,
-// so an array is rejected as a whole.
-func parseRequest(message JsonValue) Either[JsonValue, request] = message match {
+// so an array is rejected as a whole. An invalid object without an id was
+// meant as a notification, so its rejection is None: like any notification,
+// it gets no response.
+func parseRequest(message JsonValue) Either[Option[JsonValue], request] = message match {
     case JObj(_) => checkRequest(message)
-    case JArr(_) => Left(invalidRequest(JNull(), "batch requests are not supported"))
-    case _ => Left(invalidRequest(JNull(), "request must be a JSON object"))
+    case JArr(_) => Left(Some(invalidRequest(JNull(), "batch requests are not supported")))
+    case _ => Left(Some(invalidRequest(JNull(), "request must be a JSON object")))
 }
 
 // invalidRequest is the -32600 response rejecting a message for reason.
 func invalidRequest(id JsonValue, reason string) JsonValue = errorResponse(id, CodeInvalidRequest, reason)
 
 // checkRequest validates the members of a Request object.
-func checkRequest(message JsonValue) Either[JsonValue, request] {
+func checkRequest(message JsonValue) Either[Option[JsonValue], request] {
     val id = message.Get("id")
     // A null params is taken as no params, as some clients send it.
     val params = message.Get("params").Filter((p) => !p.IsNull()).GetOrElse(JObjOf())
-    val reject = (reason string) => Left[JsonValue, request](
-        invalidRequest(replyId(message).GetOrElse(JNull()), reason),
+    val reject = (reason string) => Left[Option[JsonValue], request](
+        replyId(message).Map((i) => invalidRequest(i, reason)),
     )
     if (id.Filter((i) => !isValidId(i)).IsDefined()) {
         return reject("id must be a string or an integer")
