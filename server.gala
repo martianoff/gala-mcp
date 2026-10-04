@@ -2,8 +2,10 @@ package mcp
 
 import (
     "bufio"
+    "bytes"
     "fmt"
     "io"
+    "math"
     "os"
     "strconv"
     "strings"
@@ -11,8 +13,21 @@ import (
     . "martianoff/gala/go_interop"
 )
 
-// maxLine bounds a single newline-delimited JSON-RPC message (10 MiB).
+// maxLine bounds a single newline-delimited JSON-RPC message (10 MiB). A
+// longer line is answered with an invalid-request error and skipped.
 val maxLine = 10 * 1024 * 1024
+
+// readChunk is the size of the transport's read buffer; longer lines are
+// read through it in chunks.
+val readChunk = 64 * 1024
+
+// tooLargeResponse answers a line longer than maxLine. The line is never
+// parsed, so its id is unknown and the response carries a null one.
+val tooLargeResponse = RenderJson(errorResponse(
+    JNull(),
+    CodeInvalidRequest,
+    s"request exceeds the ${maxLine / (1024 * 1024)} MiB limit",
+))
 
 // Server is an MCP server runtime: server identity plus the registered tools.
 // It speaks JSON-RPC 2.0 over newline-delimited stdio (the transport Claude
@@ -33,20 +48,81 @@ func NewServer(name string, version string) Server =
 // WithTool returns a copy of the server with one more tool registered.
 func (s Server) WithTool(t Tool) Server = s.Copy(Tools = s.Tools.Append(t))
 
-// Run serves JSON-RPC requests over stdin/stdout until stdin reaches EOF.
-// Each line of input is one request; each response is written as one line.
-func (s Server) Run() {
-    s.serve(os.Stdin, os.Stdout)
+// Run serves JSON-RPC requests over stdin/stdout until stdin reaches EOF,
+// then returns Success. Each line of input is one request; each response is
+// written as one line. If reading stdin or writing stdout fails, the client
+// is gone: Run logs the error to stderr, stops serving and returns it as a
+// Failure.
+func (s Server) Run() Try[Void] =
+    s.serve(os.Stdin, os.Stdout).OnFailure((err) => {
+        fmt.Fprintln(os.Stderr, s"mcp: stopped serving: ${strconv.Quote(err.Error())}")
+    })
+
+// serve is Run over an arbitrary reader and writer, without the logging.
+func (s Server) serve(in io.Reader, out io.Writer) Try[Void] {
+    val reader = bufio.NewReaderSize(in, readChunk)
+    var outcome = None[Try[Void]]()
+    for outcome.IsEmpty() {
+        outcome = s.step(readFrame(reader), out)
+    }
+    outcome.GetOrElse(Success(Void()))
 }
 
-// serve is Run over an arbitrary reader and writer: one request per input
-// line, one response per output line, until the reader is exhausted.
-func (s Server) serve(in io.Reader, out io.Writer) {
-    val scanner = bufio.NewScanner(in)
-    scanner.Buffer(SliceWithCapacity[byte](64 * 1024), maxLine)
-    for scanner.Scan() {
-        s.HandleLine(scanner.Text()).ForEach((resp) => { fmt.Fprintln(out, resp) })
+// step answers one frame of input, and returns the outcome of serving once
+// serving must stop: at the end of the input, or when a write fails.
+func (s Server) step(f frame, out io.Writer) Option[Try[Void]] = f match {
+    case LineFrame(text) => s.HandleLine(text).FlatMap((resp) => writeLine(out, resp))
+    case OversizedFrame() => writeLine(out, tooLargeResponse)
+    case EndFrame(outcome) => Some(outcome)
+}
+
+// writeLine writes one response line to out. A failed write means the client
+// is gone, so it returns that failure as the outcome of serving.
+func writeLine(out io.Writer, line string) Option[Try[Void]] = fmt.Fprintln(out, line) match {
+    case Failure(err) => Some(Failure[Void](err))
+    case _ => None()
+}
+
+// frame is one unit of input read from the transport.
+sealed type frame {
+    case LineFrame(Text string)
+    case OversizedFrame()
+    case EndFrame(Outcome Try[Void])
+}
+
+// readFrame reads the next newline-delimited message from r. A line longer
+// than maxLine is reported as OversizedFrame; it is skipped as it streams
+// past, so no more than maxLine bytes of it are ever held. The end of the
+// input is EndFrame with Success, and a read error is EndFrame with that
+// error.
+func readFrame(r *bufio.Reader) frame {
+    val line = New[bytes.Buffer]()
+    var size = 0
+    for {
+        var chunk, err = r.ReadSlice(byte('\n'))
+        size = size + chunk.Size()
+        // The newline itself is not part of the message.
+        if (size <= maxLine + 1) {
+            line.Write(chunk)
+        }
+        if (err != bufio.ErrBufferFull) {
+            return endOfLine(line.String(), size, err)
+        }
     }
+}
+
+// endOfLine classifies a line once reading it stopped with err (nil when the
+// line ended at a newline). size counts every byte read, including the
+// newline and any bytes skipped.
+func endOfLine(text string, size int, err error) frame {
+    val length = if (err == nil) size - 1 else size
+    if (err != nil && err != io.EOF) {
+        return EndFrame(Failure[Void](err))
+    }
+    if (length > maxLine) {
+        return OversizedFrame()
+    }
+    if (size == 0) EndFrame(Success(Void())) else LineFrame(text)
 }
 
 // HandleLine processes a single raw input line and returns the response line
@@ -66,20 +142,29 @@ func (s Server) HandleLine(line string) Option[string] {
     // A panic while parsing leaves the id unknown, which JSON-RPC 2.0 answers
     // with a null id.
     Try(ParseJson(trimmed)) match {
-        case Success(Success(request)) => s.respond(request)
+        case Success(Success(message)) => s.respond(message)
         case Success(Failure(_)) =>
             Some(RenderJson(errorResponse(JNull(), CodeParseError, "parse error")))
         case Failure(err) => internalError(Some(JNull()), err)
     }
 }
 
-// respond dispatches a parsed request inside the per-request panic boundary
-// and renders the response, if any.
-func (s Server) respond(request JsonValue) Option[string] =
-    Try(s.dispatch(request).Map(RenderJson)) match {
+// respond answers a parsed message inside the per-request panic boundary.
+func (s Server) respond(message JsonValue) Option[string] =
+    Try(s.answer(message)) match {
         case Success(resp) => resp
-        case Failure(err) => internalError(request.Get("id"), err)
+        case Failure(err) => internalError(replyId(message), err)
     }
+
+// answer validates a message and carries it out. A notification is carried
+// out like any request, but its response, success or error, is dropped.
+func (s Server) answer(message JsonValue) Option[string] = parseRequest(message) match {
+    case Left(rejection) => Some(RenderJson(rejection))
+    case Right(req) => {
+        val resp = s.dispatch(req)
+        req.Id.Map((_) => RenderJson(resp))
+    }
+}
 
 // internalError logs a panic raised while handling a request to stderr and
 // answers it with a JSON-RPC internal error for id — or with nothing when id
@@ -90,23 +175,68 @@ func internalError(id Option[JsonValue], err error) Option[string] {
     id.Map((i) => RenderJson(errorResponse(i, CodeInternalError, "internal error")))
 }
 
-// dispatch routes a parsed request to its handler, returning None for
-// notifications (requests with no id), which must not produce a response.
-func (s Server) dispatch(request JsonValue) Option[JsonValue] {
-    val idField = request.Get("id")
-    val method = request.GetString("method").GetOrElse("")
-    val id = idField.GetOrElse(JNull())
-    val isNotification = idField.IsEmpty()
+// request is a valid JSON-RPC 2.0 Request object. Id is None for a
+// notification. Params is an object or an array, and an empty object when
+// the request has none.
+struct request(Id Option[JsonValue], Method string, Params JsonValue)
 
-    return method match {
-        case "initialize" => Some(successResponse(id, s.initializeResult()))
-        case "tools/list" => Some(successResponse(id, s.toolsListResult()))
-        case "tools/call" => Some(s.handleToolCall(id, request))
-        case "ping" => Some(successResponse(id, JObjOf()))
-        // notifications/initialized and any other notification: stay silent.
-        case _ =>
-            if (isNotification) None[JsonValue]()
-            else Some(errorResponse(id, CodeMethodNotFound, s"method not found: $method"))
+// parseRequest checks that message is a valid Request object, or returns
+// the -32600 invalid-request response that rejects it. MCP has no batches,
+// so an array is rejected as a whole.
+func parseRequest(message JsonValue) Either[JsonValue, request] = message match {
+    case JObj(_) => checkRequest(message)
+    case JArr(_) => Left(errorResponse(JNull(), CodeInvalidRequest, "batch requests are not supported"))
+    case _ => Left(errorResponse(JNull(), CodeInvalidRequest, "request must be a JSON object"))
+}
+
+// checkRequest validates the members of a Request object.
+func checkRequest(message JsonValue) Either[JsonValue, request] {
+    val id = message.Get("id")
+    val params = message.Get("params").GetOrElse(JObjOf())
+    val reject = (reason string) => Left[JsonValue, request](
+        errorResponse(replyId(message).GetOrElse(JNull()), CodeInvalidRequest, reason),
+    )
+    message.GetString("method") match {
+        case _ if !id.Map(isValidId).GetOrElse(true) => reject("id must be a string or an integer")
+        case _ if message.GetString("jsonrpc").GetOrElse("") != "2.0" => reject("jsonrpc must be \"2.0\"")
+        case None => reject("method must be a string")
+        case _ if !isStructured(params) => reject("params must be an object or an array")
+        case Some(method) => Right(request(id, method, params))
+    }
+}
+
+// replyId is the id a response to message carries: the message's own id when
+// it is valid, null when it is not, and None — no response at all — when the
+// message has none.
+func replyId(message JsonValue) Option[JsonValue] =
+    message.Get("id").Map((id) => if (isValidId(id)) id else JNull())
+
+// isValidId reports whether id is a valid MCP request id: a string or an
+// integer. Unlike plain JSON-RPC 2.0, MCP does not allow a null id.
+func isValidId(id JsonValue) bool = id match {
+    case JStr(_) => true
+    case JNum(n) => n == math.Trunc(n)
+    case _ => false
+}
+
+// isStructured reports whether v may be a request's params: an object or an
+// array.
+func isStructured(v JsonValue) bool = v match {
+    case JObj(_) => true
+    case JArr(_) => true
+    case _ => false
+}
+
+// dispatch routes a valid request to its handler and builds the response.
+// For a notification the caller drops it.
+func (s Server) dispatch(req request) JsonValue {
+    val id = req.Id.GetOrElse(JNull())
+    req.Method match {
+        case "initialize" => successResponse(id, s.initializeResult())
+        case "tools/list" => successResponse(id, s.toolsListResult())
+        case "tools/call" => s.handleToolCall(id, req.Params)
+        case "ping" => successResponse(id, JObjOf())
+        case method => errorResponse(id, CodeMethodNotFound, s"method not found: $method")
     }
 }
 
@@ -137,9 +267,8 @@ func toolDescriptor(t Tool) JsonValue =
     )
 
 // handleToolCall validates params, finds the tool and runs it.
-func (s Server) handleToolCall(id JsonValue, request JsonValue) JsonValue {
-    val params = request.Get("params").GetOrElse(JObjOf())
-    return params.GetString("name") match {
+func (s Server) handleToolCall(id JsonValue, params JsonValue) JsonValue =
+    params.GetString("name") match {
         case Some(name) => {
             val args = params.Get("arguments").GetOrElse(JObjOf())
             s.Tools.Find((t) => t.Name == name) match {
@@ -149,7 +278,6 @@ func (s Server) handleToolCall(id JsonValue, request JsonValue) JsonValue {
         }
         case _ => errorResponse(id, CodeInvalidParams, "missing tool name")
     }
-}
 
 // runTool invokes a tool handler and wraps its output in the MCP
 // CallToolResult shape: a single text content block plus the isError flag.

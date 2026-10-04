@@ -1,7 +1,10 @@
 package mcp
 
 import (
+    "io"
+    "runtime"
     "strings"
+    "testing/iotest"
     . "martianoff/gala/test"
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/go_interop"
@@ -134,4 +137,191 @@ func TestServerKeepsServingAfterPanic(t T) T {
     val second = parse(out.GetOption(1).GetOrElse(""))
     val t4 = Eq(t3, second.GetInt("id").GetOrElse(-1), 8)
     IsSome(t4, second.Get("result"))
+}
+
+// --- JSON-RPC 2.0 conformance ---
+
+// reply renders HandleLine's answer to line, or "<none>" when there is none,
+// so one table can cover both responses and silence.
+func reply(line string) string = sampleServer().HandleLine(line).GetOrElse("<none>")
+
+// replyIs asserts that the sample server answers line with expected.
+func replyIs(t T, line string, expected string) T = Eq(t, reply(line), expected)
+
+// invalidRequestReply is the rendered -32600 response for id with message.
+func invalidRequestReply(id string, message string) string =
+    s"{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":-32600,\"message\":\"$message\"}}"
+
+func TestNotificationsGetNoResponse(t T) T =
+    RunCases(t,
+        replyIs,
+        Case(Name = "ping", Input = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}", Expected = "<none>"),
+        Case(Name = "initialize", Input = "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\"}", Expected = "<none>"),
+        Case(Name = "tools/list", Input = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\"}", Expected = "<none>"),
+        Case(
+            Name = "successful tool call",
+            Input = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"}}}",
+            Expected = "<none>",
+        ),
+        Case(
+            Name = "unknown tool",
+            Input = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"nope\"}}",
+            Expected = "<none>",
+        ),
+        Case(Name = "missing tool name", Input = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\"}", Expected = "<none>"),
+        Case(Name = "unknown method", Input = "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\"}", Expected = "<none>"),
+        Case(
+            Name = "params as array",
+            Input = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"params\":[]}",
+            Expected = "<none>",
+        ),
+    )
+
+// MCP requires a request id to be a string or an integer, never null; a
+// message whose id is anything else is an invalid request, answered with a
+// null id because its own cannot be echoed.
+func TestRequestIds(t T) T =
+    RunCases(t,
+        replyIs,
+        Case(
+            Name = "string id is echoed",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":\"a-1\",\"method\":\"ping\"}",
+            Expected = "{\"jsonrpc\":\"2.0\",\"id\":\"a-1\",\"result\":{}}",
+        ),
+        Case(
+            Name = "integer id is echoed",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":-3,\"method\":\"ping\"}",
+            Expected = "{\"jsonrpc\":\"2.0\",\"id\":-3,\"result\":{}}",
+        ),
+        Case(
+            Name = "null id",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\"}",
+            Expected = invalidRequestReply("null", "id must be a string or an integer"),
+        ),
+        Case(
+            Name = "fractional id",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"ping\"}",
+            Expected = invalidRequestReply("null", "id must be a string or an integer"),
+        ),
+        Case(
+            Name = "boolean id",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":true,\"method\":\"ping\"}",
+            Expected = invalidRequestReply("null", "id must be a string or an integer"),
+        ),
+        Case(
+            Name = "object id",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"ping\"}",
+            Expected = invalidRequestReply("null", "id must be a string or an integer"),
+        ),
+        Case(
+            Name = "null id on a notification method",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"notifications/initialized\"}",
+            Expected = invalidRequestReply("null", "id must be a string or an integer"),
+        ),
+    )
+
+// A message that is not a valid Request object is answered even without an
+// id: only a valid request without an id is a notification.
+func TestInvalidRequestObjects(t T) T =
+    RunCases(t,
+        replyIs,
+        Case(
+            Name = "missing jsonrpc",
+            Input = "{\"id\":9,\"method\":\"ping\"}",
+            Expected = invalidRequestReply("9", "jsonrpc must be \\\"2.0\\\""),
+        ),
+        Case(
+            Name = "wrong jsonrpc version",
+            Input = "{\"jsonrpc\":\"1.0\",\"id\":9,\"method\":\"ping\"}",
+            Expected = invalidRequestReply("9", "jsonrpc must be \\\"2.0\\\""),
+        ),
+        Case(
+            Name = "missing method",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":9}",
+            Expected = invalidRequestReply("9", "method must be a string"),
+        ),
+        Case(
+            Name = "non-string method without id",
+            Input = "{\"jsonrpc\":\"2.0\",\"method\":1,\"params\":\"bar\"}",
+            Expected = invalidRequestReply("null", "method must be a string"),
+        ),
+        Case(
+            Name = "scalar params",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\",\"params\":\"bar\"}",
+            Expected = invalidRequestReply("9", "params must be an object or an array"),
+        ),
+    )
+
+// MCP 2025-06-18 removed JSON-RPC batching, so an array is rejected as a
+// whole with one response, like any other message that is not an object.
+func TestNonObjectMessages(t T) T =
+    RunCases(t,
+        replyIs,
+        Case(Name = "number", Input = "42", Expected = invalidRequestReply("null", "request must be a JSON object")),
+        Case(Name = "string", Input = "\"x\"", Expected = invalidRequestReply("null", "request must be a JSON object")),
+        Case(Name = "boolean", Input = "true", Expected = invalidRequestReply("null", "request must be a JSON object")),
+        Case(Name = "null", Input = "null", Expected = invalidRequestReply("null", "request must be a JSON object")),
+        Case(Name = "empty batch", Input = "[]", Expected = invalidRequestReply("null", "batch requests are not supported")),
+        Case(
+            Name = "batch",
+            Input = "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"},{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}]",
+            Expected = invalidRequestReply("null", "batch requests are not supported"),
+        ),
+    )
+
+// --- The stdio transport ---
+
+val tooLargeReply = invalidRequestReply("null", "request exceeds the 10 MiB limit")
+
+func pingWithId(id int) string = s"{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"ping\"}"
+
+func pongWithId(id int) string = s"{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}"
+
+func TestServeReturnsSuccessAtEndOfInput(t T) T {
+    val out = New[strings.Builder]()
+    IsSuccess(t, sampleServer().serve(strings.NewReader(pingWithId(1) + "\n"), out))
+}
+
+func TestOversizedLineIsRejectedAndServingContinues(t T) T {
+    val huge = strings.Repeat("x", maxLine + 1)
+    val out = serveLines(sampleServer(), ArrayOf(pingWithId(1), huge, pingWithId(2)))
+    Eq(t, out.MkString("\n"), ArrayOf(pongWithId(1), tooLargeReply, pongWithId(2)).MkString("\n"))
+}
+
+func TestLineAtTheLimitIsServed(t T) T {
+    val ping = pingWithId(1)
+    val atLimit = ping + strings.Repeat(" ", maxLine - ping.ByteSize())
+    val out = serveLines(sampleServer(), ArrayOf(atLimit, pingWithId(2)))
+    Eq(t, out.MkString("\n"), ArrayOf(pongWithId(1), pongWithId(2)).MkString("\n"))
+}
+
+func TestOversizedLastLineWithoutNewline(t T) T {
+    val out = serveLines(sampleServer(), ArrayOf(pingWithId(1), strings.Repeat("x", maxLine + 1)))
+    Eq(t, out.MkString("\n"), ArrayOf(pongWithId(1), tooLargeReply).MkString("\n"))
+}
+
+// An oversized line is discarded as it streams past, not buffered whole: a
+// 100 MiB line costs far less than 100 MiB of allocation.
+func TestOversizedLineIsNotBuffered(t T) T {
+    val input = strings.Repeat("x", 100 * 1024 * 1024) + "\n" + pingWithId(1) + "\n"
+    val out = New[strings.Builder]()
+    val before = New[runtime.MemStats]()
+    runtime.ReadMemStats(before)
+    sampleServer().serve(strings.NewReader(input), out)
+    val after = New[runtime.MemStats]()
+    runtime.ReadMemStats(after)
+    val t1 = Less(t, after.TotalAlloc - before.TotalAlloc, uint64(50 * 1024 * 1024))
+    Eq(t1, out.String(), tooLargeReply + "\n" + pongWithId(1) + "\n")
+}
+
+// A failed write means the peer is gone: serving stops at once and returns
+// the error rather than reading on.
+func TestWriteErrorStopsServing(t T) T {
+    val (peer, out) = io.Pipe()
+    peer.Close()
+    val input = strings.NewReader(ArrayOf(pingWithId(1), pingWithId(2), pingWithId(3)).MkString("\n"))
+    // One byte per read, so the input left unread shows where serving stopped.
+    val result = sampleServer().serve(iotest.OneByteReader(input), out)
+    val t1 = IsFailure(t, result)
+    Eq(t1, input.Len(), (pingWithId(2) + "\n" + pingWithId(3)).ByteSize())
 }
