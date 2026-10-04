@@ -1,0 +1,202 @@
+package mcp
+
+import (
+    "math"
+    "strings"
+    . "martianoff/gala/test"
+)
+
+// outcome renders a parse result as the compact JSON on success, or the
+// error message on failure, so one table can cover both.
+func outcome(input string) string = ParseJson(input) match {
+    case Success(v) => RenderJson(v)
+    case Failure(e) => e.Error()
+}
+
+func nested(open string, close string, depth int) string =
+    strings.Repeat(open, depth) + "0" + strings.Repeat(close, depth)
+
+func TestParseStrings(t T) T {
+    return RunCases[string, string](t,
+        (sub T, input string, expected string) => Eq(sub, outcome(input), expected),
+        Case[string, string](Name = "raw emoji", Input = "\"😀\"", Expected = "\"😀\""),
+        Case[string, string](Name = "surrogate pair", Input = "\"\\ud83d\\ude00\"", Expected = "\"😀\""),
+        Case[string, string](Name = "upper-case pair", Input = "\"\\uD83D\\uDE00\"", Expected = "\"😀\""),
+        Case[string, string](Name = "lone high", Input = "\"\\ud83d\"", Expected = "\"\uFFFD\""),
+        Case[string, string](Name = "lone low", Input = "\"\\ude00\"", Expected = "\"\uFFFD\""),
+        Case[string, string](Name = "high then text", Input = "\"\\ud83dx\"", Expected = "\"\uFFFDx\""),
+        Case[string, string](Name = "high then non-surrogate", Input = "\"\\ud83d\\u0041\"", Expected = "\"\uFFFDA\""),
+        Case[string, string](Name = "high, high, low", Input = "\"\\ud83d\\ud83d\\ude00\"", Expected = "\"\uFFFD😀\""),
+        Case[string, string](Name = "low then high", Input = "\"\\ude00\\ud83d\"", Expected = "\"\uFFFD\uFFFD\""),
+        Case[string, string](
+            Name = "simple escapes",
+            Input = "\"\\\" \\\\ \\/ \\b \\f \\n \\r \\t\"",
+            Expected = "\"\\\" \\\\ / \\u0008 \\u000c \\n \\r \\t\"",
+        ),
+        Case[string, string](Name = "escaped control char", Input = "\"\\u0001\"", Expected = "\"\\u0001\""),
+        Case[string, string](Name = "text around escapes", Input = "\"ab\\ncd\\u00e9ef\"", Expected = "\"ab\\ncdéef\""),
+    )
+}
+
+func TestParseNumbers(t T) T {
+    return RunCases[string, string](t,
+        (sub T, input string, expected string) => Eq(sub, outcome(input), expected),
+        Case[string, string](Name = "zero", Input = "0", Expected = "0"),
+        Case[string, string](Name = "negative zero", Input = "-0", Expected = "-0"),
+        Case[string, string](Name = "fraction", Input = "1.5", Expected = "1.5"),
+        Case[string, string](Name = "exponent", Input = "1e2", Expected = "100"),
+        Case[string, string](Name = "upper-case negative exponent", Input = "1E-2", Expected = "0.01"),
+        Case[string, string](Name = "signed exponent", Input = "-1.25e+3", Expected = "-1250"),
+        Case[string, string](Name = "zero fraction", Input = "0.25", Expected = "0.25"),
+        Case[string, string](Name = "large", Input = "1e21", Expected = "1e+21"),
+        Case[string, string](Name = "small", Input = "1e-7", Expected = "1e-7"),
+        Case[string, string](
+            Name = "many digits",
+            Input = "123456789012345678901234567890",
+            Expected = "1.2345678901234568e+29",
+        ),
+        Case[string, string](Name = "underflow rounds to zero", Input = "1e-400", Expected = "0"),
+        Case[string, string](Name = "largest float", Input = "1.7976931348623157e308", Expected = "1.7976931348623157e+308"),
+    )
+}
+
+func TestParseRejects(t T) T {
+    return RunCases[string, string](t,
+        (sub T, input string, expected string) => Eq(sub, outcome(input), expected),
+        // Truncation always reads "unexpected end of input", at the input length.
+        Case[string, string](Name = "empty", Input = "", Expected = "json: unexpected end of input at position 0"),
+        Case[string, string](Name = "blank", Input = "   ", Expected = "json: unexpected end of input at position 3"),
+        Case[string, string](Name = "open array", Input = "[1, 2", Expected = "json: unexpected end of input at position 5"),
+        Case[string, string](Name = "open array after comma", Input = "[1,", Expected = "json: unexpected end of input at position 3"),
+        Case[string, string](Name = "open object", Input = "{\"a\":1", Expected = "json: unexpected end of input at position 6"),
+        Case[string, string](Name = "missing value", Input = "{\"a\":", Expected = "json: unexpected end of input at position 5"),
+        Case[string, string](Name = "open string", Input = "\"abc", Expected = "json: unexpected end of input at position 4"),
+        Case[string, string](Name = "open escape", Input = "\"a\\", Expected = "json: unexpected end of input at position 3"),
+        Case[string, string](Name = "short \\u", Input = "\"\\u12", Expected = "json: unexpected end of input at position 5"),
+        Case[string, string](Name = "short literal", Input = "tru", Expected = "json: unexpected end of input at position 3"),
+        Case[string, string](Name = "minus only", Input = "-", Expected = "json: unexpected end of input at position 1"),
+        Case[string, string](Name = "dot at end", Input = "1.", Expected = "json: unexpected end of input at position 2"),
+        Case[string, string](Name = "e at end", Input = "1e", Expected = "json: unexpected end of input at position 2"),
+        Case[string, string](Name = "e sign at end", Input = "1e+", Expected = "json: unexpected end of input at position 3"),
+        // Structure: the position is the offending byte.
+        Case[string, string](Name = "bare word", Input = "{bad", Expected = "json: expected string key, found 'b' at position 1"),
+        Case[string, string](Name = "missing comma", Input = "[1 2]", Expected = "json: expected ',' or ']', found '2' at position 3"),
+        Case[string, string](Name = "missing colon", Input = "{\"a\" 1}", Expected = "json: expected ':', found '1' at position 5"),
+        Case[string, string](
+            Name = "missing object comma",
+            Input = "{\"a\":1 \"b\":2}",
+            Expected = "json: expected ',' or '}', found '\"' at position 7",
+        ),
+        Case[string, string](Name = "trailing array comma", Input = "[1,]", Expected = "json: expected value, found ']' at position 3"),
+        Case[string, string](Name = "trailing object comma", Input = "{\"a\":1,}", Expected = "json: expected string key, found '}' at position 7"),
+        Case[string, string](Name = "bad literal", Input = "trux", Expected = "json: expected 'true', found 'x' at position 3"),
+        Case[string, string](Name = "trailing data", Input = "1 2", Expected = "json: expected end of input, found '2' at position 2"),
+        Case[string, string](Name = "non-ASCII byte", Input = "é", Expected = "json: expected value, found 0xc3 at position 0"),
+        // Numbers follow RFC 8259: no '+', no leading zeros, digits on both sides of '.'.
+        Case[string, string](Name = "plus sign", Input = "+1", Expected = "json: expected value, found '+' at position 0"),
+        Case[string, string](Name = "leading zero", Input = "01", Expected = "json: expected end of input, found '1' at position 1"),
+        Case[string, string](Name = "leading zero in array", Input = "[-01]", Expected = "json: expected ',' or ']', found '1' at position 3"),
+        Case[string, string](Name = "bare fraction", Input = ".5", Expected = "json: expected value, found '.' at position 0"),
+        Case[string, string](Name = "no fraction digits", Input = "1.e5", Expected = "json: expected digit, found 'e' at position 2"),
+        Case[string, string](Name = "minus letter", Input = "-a", Expected = "json: expected digit, found 'a' at position 1"),
+        Case[string, string](Name = "double minus", Input = "--1", Expected = "json: expected digit, found '-' at position 1"),
+        Case[string, string](Name = "hex number", Input = "0x10", Expected = "json: expected end of input, found 'x' at position 1"),
+        // float64 cannot hold these, and JsonValue never holds an infinity.
+        Case[string, string](Name = "overflow", Input = "1e400", Expected = "json: number out of range at position 0"),
+        Case[string, string](Name = "negative overflow", Input = "[-1e400]", Expected = "json: number out of range at position 1"),
+        // Strings.
+        Case[string, string](Name = "bad escape", Input = "\"a\\x\"", Expected = "json: invalid escape sequence at position 2"),
+        Case[string, string](Name = "\\u plus sign", Input = "\"\\u+123\"", Expected = "json: expected hex digit, found '+' at position 3"),
+        Case[string, string](Name = "\\u minus sign", Input = "\"\\u-123\"", Expected = "json: expected hex digit, found '-' at position 3"),
+        Case[string, string](Name = "\\u short", Input = "\"\\u12\"", Expected = "json: expected hex digit, found '\"' at position 5"),
+        Case[string, string](Name = "\\u non-hex", Input = "\"\\u00g0\"", Expected = "json: expected hex digit, found 'g' at position 5"),
+        Case[string, string](
+            Name = "bad escape after high surrogate",
+            Input = "\"\\ud83d\\uzzzz\"",
+            Expected = "json: expected hex digit, found 'z' at position 9",
+        ),
+        Case[string, string](Name = "raw NUL", Input = "\"a\u0000b\"", Expected = "json: unescaped control character 0x00 in string at position 2"),
+        Case[string, string](Name = "raw tab", Input = "\"a\tb\"", Expected = "json: unescaped control character 0x09 in string at position 2"),
+        Case[string, string](Name = "raw newline", Input = "\"a\nb\"", Expected = "json: unescaped control character 0x0a in string at position 2"),
+        Case[string, string](Name = "raw unit separator", Input = "\"\u001f\"", Expected = "json: unescaped control character 0x1f in string at position 1"),
+        Case[string, string](Name = "invalid UTF-8 byte", Input = "\"a\xffb\"", Expected = "json: invalid UTF-8 in string at position 2"),
+        Case[string, string](Name = "truncated UTF-8", Input = "\"\xc3\"", Expected = "json: invalid UTF-8 in string at position 1"),
+        Case[string, string](Name = "UTF-8 surrogate", Input = "\"\xed\xa0\x80\"", Expected = "json: invalid UTF-8 in string at position 1"),
+        Case[string, string](Name = "overlong UTF-8", Input = "\"\xc0\xaf\"", Expected = "json: invalid UTF-8 in string at position 1"),
+    )
+}
+
+func TestParseDepthLimit(t T) T {
+    return RunCases[string, string](t,
+        (sub T, input string, expected string) => Eq(sub, outcome(input), expected),
+        Case[string, string](
+            Name = "arrays at the limit",
+            Input = nested("[", "]", MaxJsonDepth),
+            Expected = nested("[", "]", MaxJsonDepth),
+        ),
+        Case[string, string](
+            Name = "arrays over the limit",
+            Input = nested("[", "]", MaxJsonDepth + 1),
+            Expected = "json: nesting deeper than 512 levels at position 512",
+        ),
+        Case[string, string](
+            Name = "objects at the limit",
+            Input = nested("{\"k\":", "}", MaxJsonDepth),
+            Expected = nested("{\"k\":", "}", MaxJsonDepth),
+        ),
+        Case[string, string](
+            Name = "objects over the limit",
+            Input = nested("{\"k\":", "}", MaxJsonDepth + 1),
+            Expected = "json: nesting deeper than 512 levels at position 2560",
+        ),
+        Case[string, string](
+            Name = "mixed over the limit",
+            Input = nested("[{\"k\":", "}]", MaxJsonDepth / 2 + 1),
+            Expected = "json: nesting deeper than 512 levels at position 1536",
+        ),
+    )
+}
+
+func TestParseErrorIsTyped(t T) T {
+    val offset = ParseJson("[1, x]") match {
+        case Failure(e: JsonSyntaxError) => e.Offset
+        case _ => -1
+    }
+    return Eq(t, offset, 4)
+}
+
+func TestRenderNumbers(t T) T {
+    return RunCases[float64, string](t,
+        (sub T, input float64, expected string) => Eq(sub, RenderJson(JNum(input)), expected),
+        Case[float64, string](Name = "integer", Input = 42.0, Expected = "42"),
+        Case[float64, string](Name = "fraction", Input = -2.5, Expected = "-2.5"),
+        Case[float64, string](Name = "negative zero", Input = math.Copysign(0, -1), Expected = "-0"),
+        Case[float64, string](Name = "plain below 1e21", Input = 1e20, Expected = "100000000000000000000"),
+        Case[float64, string](Name = "exponent from 1e21", Input = 1e21, Expected = "1e+21"),
+        Case[float64, string](Name = "plain from 1e-6", Input = 0.000001, Expected = "0.000001"),
+        Case[float64, string](Name = "exponent below 1e-6", Input = 1.5e-7, Expected = "1.5e-7"),
+        Case[float64, string](Name = "largest float", Input = math.MaxFloat64, Expected = "1.7976931348623157e+308"),
+        Case[float64, string](Name = "smallest float", Input = math.SmallestNonzeroFloat64, Expected = "5e-324"),
+        // JSON has no NaN or Infinity: they render as null.
+        Case[float64, string](Name = "NaN", Input = math.NaN(), Expected = "null"),
+        Case[float64, string](Name = "+Inf", Input = math.Inf(1), Expected = "null"),
+        Case[float64, string](Name = "-Inf", Input = math.Inf(-1), Expected = "null"),
+    )
+}
+
+func TestRenderStrings(t T) T {
+    return RunCases[string, string](t,
+        (sub T, input string, expected string) => Eq(sub, RenderJson(JStr(input)), expected),
+        Case[string, string](Name = "plain", Input = "hi", Expected = "\"hi\""),
+        Case[string, string](Name = "quote and backslash", Input = "a\"b\\c", Expected = "\"a\\\"b\\\\c\""),
+        Case[string, string](Name = "whitespace escapes", Input = "\n\r\t", Expected = "\"\\n\\r\\t\""),
+        Case[string, string](Name = "control chars", Input = "\u0000\u001f", Expected = "\"\\u0000\\u001f\""),
+        Case[string, string](Name = "emoji", Input = "😀", Expected = "\"😀\""),
+        Case[string, string](Name = "invalid UTF-8", Input = "a\xffb", Expected = "\"a\uFFFDb\""),
+    )
+}
+
+func TestRenderedOutputParses(t T) T {
+    val v = JArrOf(JNum(math.NaN()), JNum(math.Inf(1)), JNum(1e300), JStr("a\xff"), JStr("\u0001"))
+    return IsSuccess(t, ParseJson(RenderJson(v)))
+}
