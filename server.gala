@@ -2,6 +2,8 @@ package mcp
 
 import (
     "bufio"
+    "fmt"
+    "io"
     "os"
     "strings"
     . "martianoff/gala/collection_immutable"
@@ -33,11 +35,16 @@ func (s Server) WithTool(t Tool) Server = s.Copy(Tools = s.Tools.Append(t))
 // Run serves JSON-RPC requests over stdin/stdout until stdin reaches EOF.
 // Each line of input is one request; each response is written as one line.
 func (s Server) Run() {
-    val scanner = bufio.NewScanner(os.Stdin)
+    s.serve(os.Stdin, os.Stdout)
+}
+
+// serve is Run over an arbitrary reader and writer: one request per input
+// line, one response per output line, until the reader is exhausted.
+func (s Server) serve(in io.Reader, out io.Writer) {
+    val scanner = bufio.NewScanner(in)
     scanner.Buffer(SliceWithCapacity[byte](64 * 1024), maxLine)
     for scanner.Scan() {
-        val line = scanner.Text()
-        s.HandleLine(line).ForEach((out) => { Println(out) })
+        s.HandleLine(scanner.Text()).ForEach((resp) => { fmt.Fprintln(out, resp) })
     }
 }
 

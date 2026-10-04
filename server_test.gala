@@ -1,8 +1,10 @@
 package mcp
 
 import (
+    "strings"
     . "martianoff/gala/test"
     . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/go_interop"
 )
 
 // sampleServer builds a server exposing a single `echo` tool that returns its
@@ -85,3 +87,51 @@ func TestPing(t T) T {
 
 func TestBlankLineNoResponse(t T) T =
     IsNone(t, sampleServer().HandleLine("   "))
+
+// --- A failing request no longer stops the server ---
+
+// panickyServer adds a `boom` tool whose handler panics (Head of an empty
+// Array), standing in for any bug reached while handling a request.
+func panickyServer() Server =
+    sampleServer().WithTool(Tool(
+        Name = "boom",
+        Description = "Always panics",
+        InputSchema = JObjOf(JField("type", JStr("object"))),
+        Handler = (args) => OkResult(EmptyArray[string]().Head()),
+    ))
+
+val boomRequest = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"boom\"}}"
+val boomNotification = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"boom\"}}"
+val pingRequest = "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}"
+
+// serveLines runs the stdio serving loop over the given input lines and
+// returns the non-empty output lines it wrote.
+func serveLines(s Server, lines Array[string]) Array[string] {
+    val out = New[strings.Builder]()
+    s.serve(strings.NewReader(lines.MkString("\n")), out)
+    ArrayFromSlice(strings.Split(out.String(), "\n")).Filter((l) => l != "")
+}
+
+func TestPanickingRequestReturnsInternalError(t T) T {
+    val v = parse(panickyServer().HandleLine(boomRequest).GetOrElse(""))
+    val err = v.Get("error").GetOrElse(JNull())
+    val t1 = Eq(t, v.GetInt("id").GetOrElse(-1), 7)
+    val t2 = Eq(t1, err.GetInt("code").GetOrElse(0), CodeInternalError)
+    // The panic value goes to stderr only, never to the client.
+    val t3 = Eq(t2, err.GetString("message").GetOrElse(""), "internal error")
+    IsNone(t3, v.Get("result"))
+}
+
+func TestPanickingNotificationNoResponse(t T) T =
+    IsNone(t, panickyServer().HandleLine(boomNotification))
+
+func TestServerKeepsServingAfterPanic(t T) T {
+    val out = serveLines(panickyServer(), ArrayOf(boomRequest, boomNotification, pingRequest))
+    val t1 = Eq(t, out.Length(), 2)
+    val first = parse(out.GetOption(0).GetOrElse(""))
+    val t2 = Eq(t1, first.GetInt("id").GetOrElse(-1), 7)
+    val t3 = Eq(t2, first.Get("error").GetOrElse(JNull()).GetInt("code").GetOrElse(0), CodeInternalError)
+    val second = parse(out.GetOption(1).GetOrElse(""))
+    val t4 = Eq(t3, second.GetInt("id").GetOrElse(-1), 8)
+    IsSome(t4, second.Get("result"))
+}
