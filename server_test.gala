@@ -152,29 +152,31 @@ func replyIs(t T, line string, expected string) T = Eq(t, reply(line), expected)
 func invalidRequestReply(id string, message string) string =
     s"{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":-32600,\"message\":\"$message\"}}"
 
+// notification is a request for method without an id; params is its params
+// JSON, or "" for none.
+func notification(method string, params string = "") string =
+    if (params == "") s"{\"jsonrpc\":\"2.0\",\"method\":\"$method\"}"
+    else s"{\"jsonrpc\":\"2.0\",\"method\":\"$method\",\"params\":$params}"
+
 func TestNotificationsGetNoResponse(t T) T =
     RunCases(t,
         replyIs,
-        Case(Name = "ping", Input = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}", Expected = "<none>"),
-        Case(Name = "initialize", Input = "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\"}", Expected = "<none>"),
-        Case(Name = "tools/list", Input = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\"}", Expected = "<none>"),
+        Case(Name = "ping", Input = notification("ping"), Expected = "<none>"),
+        Case(Name = "initialize", Input = notification("initialize"), Expected = "<none>"),
+        Case(Name = "tools/list", Input = notification("tools/list"), Expected = "<none>"),
         Case(
             Name = "successful tool call",
-            Input = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"}}}",
+            Input = notification("tools/call", "{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"}}"),
             Expected = "<none>",
         ),
         Case(
             Name = "unknown tool",
-            Input = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"nope\"}}",
+            Input = notification("tools/call", "{\"name\":\"nope\"}"),
             Expected = "<none>",
         ),
-        Case(Name = "missing tool name", Input = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\"}", Expected = "<none>"),
-        Case(Name = "unknown method", Input = "{\"jsonrpc\":\"2.0\",\"method\":\"bogus\"}", Expected = "<none>"),
-        Case(
-            Name = "params as array",
-            Input = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"params\":[]}",
-            Expected = "<none>",
-        ),
+        Case(Name = "missing tool name", Input = notification("tools/call"), Expected = "<none>"),
+        Case(Name = "unknown method", Input = notification("bogus"), Expected = "<none>"),
+        Case(Name = "params as array", Input = notification("ping", "[]"), Expected = "<none>"),
     )
 
 // MCP requires a request id to be a string or an integer, never null; a
@@ -257,17 +259,21 @@ func TestInvalidRequestObjects(t T) T =
 func TestNonObjectMessages(t T) T =
     RunCases(t,
         replyIs,
-        Case(Name = "number", Input = "42", Expected = invalidRequestReply("null", "request must be a JSON object")),
-        Case(Name = "string", Input = "\"x\"", Expected = invalidRequestReply("null", "request must be a JSON object")),
-        Case(Name = "boolean", Input = "true", Expected = invalidRequestReply("null", "request must be a JSON object")),
-        Case(Name = "null", Input = "null", Expected = invalidRequestReply("null", "request must be a JSON object")),
-        Case(Name = "empty batch", Input = "[]", Expected = invalidRequestReply("null", "batch requests are not supported")),
+        Case(Name = "number", Input = "42", Expected = notAnObjectReply),
+        Case(Name = "string", Input = "\"x\"", Expected = notAnObjectReply),
+        Case(Name = "boolean", Input = "true", Expected = notAnObjectReply),
+        Case(Name = "null", Input = "null", Expected = notAnObjectReply),
+        Case(Name = "empty batch", Input = "[]", Expected = noBatchesReply),
         Case(
             Name = "batch",
-            Input = "[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"},{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}]",
-            Expected = invalidRequestReply("null", "batch requests are not supported"),
+            Input = s"[${pingWithId(1)},${notification("ping")}]",
+            Expected = noBatchesReply,
         ),
     )
+
+val notAnObjectReply = invalidRequestReply("null", "request must be a JSON object")
+
+val noBatchesReply = invalidRequestReply("null", "batch requests are not supported")
 
 // --- The stdio transport ---
 
@@ -319,7 +325,7 @@ func TestOversizedLineIsNotBuffered(t T) T {
 func TestWriteErrorStopsServing(t T) T {
     val (peer, out) = io.Pipe()
     peer.Close()
-    val input = strings.NewReader(ArrayOf(pingWithId(1), pingWithId(2), pingWithId(3)).MkString("\n"))
+    val input = strings.NewReader(ArrayOf(1, 2, 3).Map(pingWithId).MkString("\n"))
     // One byte per read, so the input left unread shows where serving stopped.
     val result = sampleServer().serve(iotest.OneByteReader(input), out)
     val t1 = IsFailure(t, result)

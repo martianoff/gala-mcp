@@ -23,9 +23,8 @@ val readChunk = 64 * 1024
 
 // tooLargeResponse answers a line longer than maxLine. The line is never
 // parsed, so its id is unknown and the response carries a null one.
-val tooLargeResponse = RenderJson(errorResponse(
+val tooLargeResponse = RenderJson(invalidRequest(
     JNull(),
-    CodeInvalidRequest,
     s"request exceeds the ${maxLine / (1024 * 1024)} MiB limit",
 ))
 
@@ -61,11 +60,13 @@ func (s Server) Run() Try[Void] =
 // serve is Run over an arbitrary reader and writer, without the logging.
 func (s Server) serve(in io.Reader, out io.Writer) Try[Void] {
     val reader = bufio.NewReaderSize(in, readChunk)
-    var outcome = None[Try[Void]]()
-    for outcome.IsEmpty() {
-        outcome = s.step(readFrame(reader), out)
+    for {
+        val next = s.step(readFrame(reader), out)
+        next match {
+            case Some(outcome) => { return outcome }
+            case None() => {}
+        }
     }
-    outcome.GetOrElse(Success(Void()))
 }
 
 // step answers one frame of input, and returns the outcome of serving once
@@ -99,7 +100,7 @@ func readFrame(r *bufio.Reader) frame {
     val line = New[bytes.Buffer]()
     var size = 0
     for {
-        var chunk, err = r.ReadSlice(byte('\n'))
+        val chunk, err = r.ReadSlice(byte('\n'))
         size = size + chunk.Size()
         // The newline itself is not part of the message.
         if (size <= maxLine + 1) {
@@ -185,20 +186,24 @@ struct request(Id Option[JsonValue], Method string, Params JsonValue)
 // so an array is rejected as a whole.
 func parseRequest(message JsonValue) Either[JsonValue, request] = message match {
     case JObj(_) => checkRequest(message)
-    case JArr(_) => Left(errorResponse(JNull(), CodeInvalidRequest, "batch requests are not supported"))
-    case _ => Left(errorResponse(JNull(), CodeInvalidRequest, "request must be a JSON object"))
+    case JArr(_) => Left(invalidRequest(JNull(), "batch requests are not supported"))
+    case _ => Left(invalidRequest(JNull(), "request must be a JSON object"))
 }
+
+// invalidRequest is the -32600 response rejecting a message for reason.
+func invalidRequest(id JsonValue, reason string) JsonValue = errorResponse(id, CodeInvalidRequest, reason)
 
 // checkRequest validates the members of a Request object.
 func checkRequest(message JsonValue) Either[JsonValue, request] {
     val id = message.Get("id")
     val params = message.Get("params").GetOrElse(JObjOf())
     val reject = (reason string) => Left[JsonValue, request](
-        errorResponse(replyId(message).GetOrElse(JNull()), CodeInvalidRequest, reason),
+        invalidRequest(replyId(message).GetOrElse(JNull()), reason),
     )
     message.GetString("method") match {
         case _ if !id.Map(isValidId).GetOrElse(true) => reject("id must be a string or an integer")
-        case _ if message.GetString("jsonrpc").GetOrElse("") != "2.0" => reject("jsonrpc must be \"2.0\"")
+        case _ if message.GetString("jsonrpc").GetOrElse("") != "2.0" =>
+            reject("jsonrpc must be \"2.0\"")
         case None => reject("method must be a string")
         case _ if !isStructured(params) => reject("params must be an object or an array")
         case Some(method) => Right(request(id, method, params))
