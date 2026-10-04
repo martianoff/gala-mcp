@@ -10,7 +10,9 @@ func TestRenderPrimitives(t T) T {
     val t3 = Eq(t2, RenderJson(JBool(false)), "false")
     val t4 = Eq(t3, RenderJson(JInt(42)), "42")
     val t5 = Eq(t4, RenderJson(JStr("hi")), "\"hi\"")
-    return Eq(t5, RenderJson(JStr("a\"b\nc")), "\"a\\\"b\\nc\"")
+    val t6 = Eq(t5, RenderJson(JStr("a\"b\nc")), "\"a\\\"b\\nc\"")
+    // The escaper walks bytes; a rune-count bound would cut a multibyte string short.
+    return Eq(t6, RenderJson(JStr("héllo ✓")), "\"héllo ✓\"")
 }
 
 func TestRenderObjectPreservesOrder(t T) T {
@@ -39,6 +41,7 @@ func TestParseRoundTrip(t T) T {
         Case[string, string](Name = "int", Input = "123", Expected = "123"),
         Case[string, string](Name = "neg", Input = "-7", Expected = "-7"),
         Case[string, string](Name = "string", Input = "\"hello\"", Expected = "\"hello\""),
+        // A multibyte string: the string scanner must be bounded by bytes, not runes.
         Case[string, string](Name = "multibyte", Input = "\"héllo — ✓\"", Expected = "\"héllo — ✓\""),
         Case[string, string](Name = "unicode escape", Input = "\"caf\\u00e9\"", Expected = "\"café\""),
         Case[string, string](Name = "array", Input = "[1, 2, 3]", Expected = "[1,2,3]"),
@@ -64,5 +67,8 @@ func TestParseAccessors(t T) T {
 func TestParseInvalid(t T) T {
     val t1 = IsFailure(t, ParseJson("{bad"))
     val t2 = IsFailure(t1, ParseJson("[1, 2"))
-    return IsFailure(t2, ParseJson(""))
+    val t3 = IsFailure(t2, ParseJson(""))
+    // Trailing data sitting past the rune count but inside the byte count: the
+    // trailing-data check must compare against bytes.
+    return IsFailure(t3, ParseJson("\"é\"x"))
 }
