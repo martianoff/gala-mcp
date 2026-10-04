@@ -40,6 +40,18 @@ func TestParseStrings(t T) T =
         Case(Name = "text around escapes", Input = "\"ab\\ncd\\u00e9ef\"", Expected = "\"ab\\ncdéef\""),
     )
 
+func TestParseStructure(t T) T =
+    RunCases(t,
+        outcomeIs,
+        Case(Name = "empty containers", Input = "[{},[]]", Expected = "[{},[]]"),
+        Case(
+            Name = "whitespace everywhere",
+            Input = " \t{ \"a\" : [ 1 , 2 ] ,\r\n \"b\" : { } }\n",
+            Expected = "{\"a\":[1,2],\"b\":{}}",
+        ),
+        Case(Name = "duplicate keys kept in order", Input = "{\"a\":1,\"a\":2}", Expected = "{\"a\":1,\"a\":2}"),
+    )
+
 func TestParseNumbers(t T) T =
     RunCases(t,
         outcomeIs,

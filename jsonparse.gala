@@ -143,7 +143,7 @@ func parseSeq[E any](p *jsonParser, depth int, close byte, elem func() Try[E]) T
     }
 }
 
-// parseField parses one `"key": value` member of an object.
+// parseField parses one `"key": value` member of an object, skipping leading whitespace.
 // depth: the nesting depth of the enclosing object.
 func (p *jsonParser) parseField(depth int) Try[JField] {
     p.skipWs()
@@ -300,8 +300,7 @@ func (p *jsonParser) parseLiteral(lit string, v JsonValue) Try[JsonValue] =
 // ok: tests the byte at offset i of the run.
 func (p *jsonParser) expectRun(n int, want string, ok func(int, byte) bool) Try[string] {
     val start = p.pos
-    // Per-token hot path: an index loop allocates nothing, where a stream
-    // search would allocate for every byte.
+    // An index loop, like skipWhile's, keeps this per-token path allocation-free.
     for p.pos < start + n {
         if p.atEnd() || !ok(p.pos - start, p.data[p.pos]) {
             return Failure(p.mismatch(want))
