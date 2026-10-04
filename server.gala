@@ -52,17 +52,39 @@ func (s Server) serve(in io.Reader, out io.Writer) {
 // to write back, or None when the input warrants no response (a blank line or
 // a JSON-RPC notification). This is the pure core of the server and is what
 // tests drive directly.
+//
+// A panic while handling the line — in a tool handler or in the server
+// itself — is logged to stderr and answered with a JSON-RPC internal error
+// (or with nothing, for a notification), so one failing request never stops
+// the server.
 func (s Server) HandleLine(line string) Option[string] {
     val trimmed = strings.TrimSpace(line)
     if trimmed == "" {
         return None[string]()
     }
-    return ParseJson(trimmed) match {
-        case Success(request) => s.dispatch(request).Map((resp) => RenderJson(resp))
+    // Until the line parses its id is unknown, and JSON-RPC 2.0 answers such
+    // an error with a null id.
+    return recoverRequest(Some(JNull()), () => ParseJson(trimmed) match {
+        case Success(request) =>
+            recoverRequest(request.Get("id"), () => s.dispatch(request).Map((resp) => RenderJson(resp)))
         case Failure(_) =>
             Some(RenderJson(errorResponse(JNull(), CodeParseError, "parse error")))
-    }
+    })
 }
+
+// recoverRequest is the per-request panic boundary. It returns handle's
+// response; if handle panics, it logs the panic to stderr and instead answers
+// with a JSON-RPC internal error for id — or with nothing when id is None,
+// since a notification never gets a response. The panic value is not sent
+// to the client.
+func recoverRequest(id Option[JsonValue], handle func() Option[string]) Option[string] =
+    Try(() => handle()) match {
+        case Success(resp) => resp
+        case Failure(err) => {
+            fmt.Fprintln(os.Stderr, s"mcp: request handling panicked: $err")
+            id.Map((i) => RenderJson(errorResponse(i, CodeInternalError, "internal error")))
+        }
+    }
 
 // dispatch routes a parsed request to its handler, returning None for
 // notifications (requests with no id), which must not produce a response.
@@ -125,10 +147,11 @@ func (s Server) handleToolCall(id JsonValue, request JsonValue) JsonValue {
     }
 }
 
-// runTool invokes a tool handler (catching panics) and wraps its output in the
-// MCP CallToolResult shape: a single text content block plus the isError flag.
+// runTool invokes a tool handler and wraps its output in the MCP
+// CallToolResult shape: a single text content block plus the isError flag.
+// A handler that panics is handled by HandleLine's per-request boundary.
 func runTool(tool Tool, args JsonValue) JsonValue {
-    val result = Try(() => tool.Handler(args)).GetOrElse(ErrResult("tool handler panicked"))
+    val result = tool.Handler(args)
     return JObjOf(
         JField("content", JArrOf(
             JObjOf(

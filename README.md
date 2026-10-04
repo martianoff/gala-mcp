@@ -66,6 +66,11 @@ func main() {
 | `OkResult(text) / ErrResult(text)` | Build a tool result; `ErrResult` sets `isError`. |
 | `ToolResult.Text` / `ToolResult.IsError` | The result's text payload and error flag. |
 
+Report an expected tool failure with `ErrResult`, so the model can read it. A request whose
+handling panics — in a tool handler or in the server — is answered with a JSON-RPC internal
+error (`-32603`, carrying the request's id; no response for a notification), the panic is
+logged to stderr, and the server goes on serving the next request.
+
 **JSON values** — `JsonValue` is a sealed type: `JNull`, `JBool`, `JNum`, `JStr`, `JArr`, `JObj`.
 
 | Builder | Accessor |
