@@ -74,3 +74,15 @@ func main() {
 | `JObjOf(fields...)`, `JField(key, value)` | `Get(key)`, `GetString(key)`, `GetInt(key)`, `GetObject(key)` |
 | `JArrOf(items...)` | `AsArray()` → `Option[Array[JsonValue]]` |
 | `ParseJson(s) Try[JsonValue]` | `RenderJson(v) string` |
+
+`ParseJson` follows RFC 8259 strictly. Malformed input is a `Failure` holding a
+`JsonSyntaxError(Msg, Offset)`, where `Offset` is the byte offset of the offending byte (the
+input length when the input ends early, reported as `unexpected end of input`). Nesting
+deeper than `MaxJsonDepth` (512) arrays/objects is rejected. A number outside `float64`'s range
+(`1e400`) is rejected, and one too small to represent (`1e-400`) parses as `0`. A UTF-16
+surrogate escape without its partner (`"\ud83d"`) decodes as U+FFFD, as Go's `encoding/json`
+does.
+
+`RenderJson` always produces valid JSON: NaN and ±Inf render as `null` (as `JSON.stringify`
+does), invalid UTF-8 in a string renders as U+FFFD, and numbers use the shortest round-trip
+form, switching to exponent notation outside `1e-6 <= |n| < 1e21` (`1e+21`, `1.5e-7`).
