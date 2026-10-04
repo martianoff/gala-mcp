@@ -8,7 +8,6 @@ import (
     "unicode/utf8"
     "martianoff/gala/go_interop"
     "martianoff/gala/json"
-    "martianoff/gala/stream"
     . "martianoff/gala/collection_immutable"
 )
 
@@ -69,7 +68,7 @@ func renderNumber(n float64) string {
 // string escaper.
 func quote(s string) string {
     val e = json.NewJsonEncoder()
-    e.WriteString(if (utf8.ValidString(s)) s else strings.ToValidUTF8(s, "\uFFFD"))
+    e.WriteString(strings.ToValidUTF8(s, "\uFFFD"))
     e.String()
 }
 
@@ -88,9 +87,6 @@ type jsonParser struct {
 func (p *jsonParser) parseValue(depth int) Try[JsonValue] {
     p.skipWs()
     val c = p.peek()
-    if (c == '{' || c == '[') && depth >= MaxJsonDepth {
-        return Failure(JsonSyntaxError(s"nesting deeper than $MaxJsonDepth levels", p.pos))
-    }
     c match {
         case '{' => p.parseObject(depth + 1)
         case '[' => p.parseArray(depth + 1)
@@ -106,18 +102,22 @@ func (p *jsonParser) parseValue(depth int) Try[JsonValue] {
 // parseObject parses an object; the cursor is on its '{'.
 // depth: the nesting depth of the object itself.
 func (p *jsonParser) parseObject(depth int) Try[JsonValue] =
-    parseSeq(p, '}', () => p.parseField(depth)).Map((fields) => JObj(fields))
+    parseSeq(p, depth, '}', () => p.parseField(depth)).Map((fields) => JObj(fields))
 
 // parseArray parses an array; the cursor is on its '['.
 // depth: the nesting depth of the array itself.
 func (p *jsonParser) parseArray(depth int) Try[JsonValue] =
-    parseSeq(p, ']', () => p.parseValue(depth)).Map((items) => JArr(items))
+    parseSeq(p, depth, ']', () => p.parseValue(depth)).Map((items) => JArr(items))
 
 // parseSeq parses the comma-separated elements of an array or object; the
 // cursor is on its opening bracket.
+// depth: the nesting depth of the array or object itself.
 // close: the closing bracket.
 // elem: parses one element.
-func parseSeq[E any](p *jsonParser, close byte, elem func() Try[E]) Try[Array[E]] {
+func parseSeq[E any](p *jsonParser, depth int, close byte, elem func() Try[E]) Try[Array[E]] {
+    if depth > MaxJsonDepth {
+        return Failure(JsonSyntaxError(s"nesting deeper than $MaxJsonDepth levels", p.pos))
+    }
     p.pos = p.pos + 1
     p.skipWs()
     if p.peek() == close {
@@ -197,6 +197,7 @@ func (p *jsonParser) parseString() Try[string] {
 
 // readEscape decodes one escape sequence; the cursor is just past its backslash.
 func (p *jsonParser) readEscape() Try[rune] {
+    val backslash = p.pos - 1
     if p.atEnd() {
         return Failure(p.mismatch("escape sequence"))
     }
@@ -212,7 +213,7 @@ func (p *jsonParser) readEscape() Try[rune] {
         case 'r' => Success('\r')
         case 't' => Success('\t')
         case 'u' => p.readUnicodeEscape()
-        case _ => Failure(JsonSyntaxError("invalid escape sequence", p.pos - 2))
+        case _ => Failure(JsonSyntaxError("invalid escape sequence", backslash))
     }
 }
 
@@ -274,7 +275,7 @@ func (p *jsonParser) parseNumber() Try[JsonValue] {
         }
     }
     // The grammar is already checked, so the only failure left is overflow.
-    strconv.ParseFloat(go_interop.ToString(go_interop.Slice(p.data, start, p.pos)), 64) match {
+    strconv.ParseFloat(p.textFrom(start), 64) match {
         case Success(n) => Success(JNum(n))
         case Failure(_) => Failure(JsonSyntaxError("number out of range", start))
     }
@@ -299,23 +300,28 @@ func (p *jsonParser) parseLiteral(lit string, v JsonValue) Try[JsonValue] =
 // ok: tests the byte at offset i of the run.
 func (p *jsonParser) expectRun(n int, want string, ok func(int, byte) bool) Try[string] {
     val start = p.pos
-    stream.Range(start, start + n).Find((i) => i >= p.data.Size() || !ok(i - start, p.data[i])) match {
-        case Some(bad) => {
-            p.pos = bad
-            Failure(p.mismatch(want))
+    // Per-token hot path: an index loop allocates nothing, where a stream
+    // search would allocate for every byte.
+    for p.pos < start + n {
+        if p.atEnd() || !ok(p.pos - start, p.data[p.pos]) {
+            return Failure(p.mismatch(want))
         }
-        case None() => {
-            p.pos = start + n
-            Success(go_interop.ToString(go_interop.Slice(p.data, start, p.pos)))
-        }
+        p.pos = p.pos + 1
     }
+    Success(p.textFrom(start))
 }
 
 // skipWhile advances the cursor past the run of bytes for which pred holds.
 func (p *jsonParser) skipWhile(pred func(byte) bool) {
-    val end = p.data.Size()
-    p.pos = stream.Range(p.pos, end).Find((i) => !pred(p.data[i])).GetOrElse(end)
+    // Per-token hot path: an index loop allocates nothing, where a stream
+    // search would allocate for every byte.
+    for !p.atEnd() && pred(p.data[p.pos]) {
+        p.pos = p.pos + 1
+    }
 }
+
+// textFrom returns the input bytes from start up to the cursor as a string.
+func (p *jsonParser) textFrom(start int) string = go_interop.ToString(go_interop.Slice(p.data, start, p.pos))
 
 // mismatch is the error for a cursor not on what the grammar wants:
 // "unexpected end of input" when the input ran out, else the offending byte.
