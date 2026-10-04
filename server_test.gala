@@ -352,3 +352,14 @@ func TestWriteErrorStopsServing(t T) T {
     val t1 = IsFailure(t, result)
     Eq(t1, input.Len(), (pingWithId(2) + "\n" + pingWithId(3)).ByteSize())
 }
+
+// A CRLF line ending is not part of the message, so it does not count
+// toward the limit either.
+func TestCrlfLineAtTheLimitIsServed(t T) T {
+    val ping = pingWithId(1)
+    val atLimit = ping + strings.Repeat(" ", maxLine - ping.ByteSize())
+    val input = atLimit + "\r\n" + pingWithId(2) + "\r\n"
+    val out = New[strings.Builder]()
+    sampleServer().serve(strings.NewReader(input), out)
+    Eq(t, out.String(), pongWithId(1) + "\n" + pongWithId(2) + "\n")
+}

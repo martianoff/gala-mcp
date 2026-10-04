@@ -57,13 +57,15 @@ func (s Server) WithTool(t Tool) Server = s.Copy(Tools = s.Tools.Append(t))
 // Failure.
 //
 // On Unix, a write to a stdout whose reader has gone raises SIGPIPE, which
-// kills a Go process before the write can fail with an error. Run therefore
-// subscribes to SIGPIPE, which makes the write fail instead. Unlike ignoring
-// the signal, this leaves the signal handling of child processes and any
-// other subscriber untouched.
+// kills a Go process before the write can fail with an error. While it
+// serves, Run therefore subscribes to SIGPIPE, which makes the write fail
+// instead. Unlike ignoring the signal, this leaves the signal handling of
+// child processes and of any other subscriber untouched.
 func (s Server) Run() Try[Void] {
-    signal.NotifyContext(context.Background(), syscall.SIGPIPE)
-    s.serve(os.Stdin, os.Stdout).OnFailure((err) => {
+    val (_, stopCatchingSigpipe) = signal.NotifyContext(context.Background(), syscall.SIGPIPE)
+    val outcome = s.serve(os.Stdin, os.Stdout)
+    stopCatchingSigpipe()
+    outcome.OnFailure((err) => {
         fmt.Fprintln(os.Stderr, s"mcp: stopped serving: ${strconv.Quote(err.Error())}")
     })
 }
@@ -102,48 +104,43 @@ sealed type frame {
     case EndFrame(Outcome Try[Void])
 }
 
-// readFrame reads the next newline-delimited message from r. A line longer
-// than maxLine is reported as OversizedFrame; it is skipped as it streams
-// past, so no more than maxLine bytes of it are ever held. The end of the
-// input is EndFrame with Success, and a read error is EndFrame with that
+// readFrame reads the next message from r: one line, ended by LF or CRLF. A
+// line longer than maxLine is reported as OversizedFrame; it is skipped as it
+// streams past, so no more than maxLine bytes of it are ever held. The end of
+// the input is EndFrame with Success, and a read error is EndFrame with that
 // error.
 func readFrame(r *bufio.Reader) frame {
     val line = New[bytes.Buffer]()
     var size = 0
     for {
-        val chunk, err = r.ReadSlice(byte('\n'))
-        // The chunk that ends a line (err == nil) ends with the newline,
-        // which is not part of the message.
-        val body = if (err == nil) SliceTo(chunk, chunk.Size() - 1) else chunk
-        size = size + body.Size()
+        // A line longer than the read buffer arrives in chunks, all but the
+        // last flagged as a prefix.
+        val chunk, isPrefix, err = r.ReadLine()
+        size = size + chunk.Size()
         if (size <= maxLine) {
-            line.Write(body)
+            line.Write(chunk)
         }
-        if (err != bufio.ErrBufferFull) {
+        if (!isPrefix) {
             return endOfLine(line, size, err)
         }
     }
 }
 
-// endOfLine classifies a line once reading it stopped with err: nil at a
-// newline, io.EOF at the end of the input. size is the line's length without
-// the newline, and line holds it unless it is longer than maxLine.
+// endOfLine classifies a line once its last chunk is read. ReadLine returns
+// either a chunk or an error, so err is set only when no line remains: at the
+// end of the input (io.EOF) or on a read error. line holds the line unless
+// size, its length, is over maxLine.
 func endOfLine(line *bytes.Buffer, size int, err error) frame {
-    if (err != nil && err != io.EOF) {
-        return EndFrame(Failure[Void](err))
+    if (err != nil) {
+        return EndFrame(if (err == io.EOF) Success(Void()) else Failure[Void](err))
     }
-    if (size > maxLine) {
-        return OversizedFrame()
-    }
-    if (err == io.EOF && line.Len() == 0) {
-        return EndFrame(Success(Void()))
-    }
-    LineFrame(line.String())
+    if (size > maxLine) OversizedFrame() else LineFrame(line.String())
 }
 
 // HandleLine processes a single raw input line and returns the response line
-// to write back, or None when the input warrants no response (a blank line or
-// a JSON-RPC notification). This is the core of the server and is what
+// to write back, or None when the input warrants no response: a blank line, a JSON-RPC
+// notification (an object without an id, valid or not), or a stray JSON-RPC
+// response. This is the core of the server and is what
 // tests drive directly.
 //
 // A panic while handling the line — in a tool handler or in the server
@@ -244,11 +241,13 @@ func checkRequest(message JsonValue) Either[Option[JsonValue], request] {
     }
 }
 
-// replyId is the id a response to message carries: the message's own id when
+// replyId is the id a response to message carries: an object's own id when
 // it is valid, null when it is not, and None — no response at all — when the
-// message has none.
-func replyId(message JsonValue) Option[JsonValue] =
-    message.Get("id").Map((id) => if (isValidId(id)) id else JNull())
+// object has none. Any other message is answered with a null id.
+func replyId(message JsonValue) Option[JsonValue] = message match {
+    case JObj(_) => message.Get("id").Map((id) => if (isValidId(id)) id else JNull())
+    case _ => Some(JNull())
+}
 
 // maxExactId is the largest integer id a JSON number (a float64) holds
 // exactly, and so can be echoed back unchanged.
