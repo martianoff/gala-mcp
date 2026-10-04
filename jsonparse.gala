@@ -138,18 +138,13 @@ func (p *jsonParser) parseField(depth int) Try[JField] {
         return Failure(p.mismatch("string key"))
     }
     bind key = p.parseString()
-    bind value = p.parseFieldValue(depth)
-    Success(JField(key, value))
-}
-
-// TEMP
-func (p *jsonParser) parseFieldValue(depth int) Try[JsonValue] {
     p.skipWs()
     if p.peek() != ':' {
         return Failure(p.mismatch("':'"))
     }
     p.pos = p.pos + 1
-    p.parseValue(depth)
+    bind value = p.parseValue(depth)
+    Success(JField(key, value))
 }
 
 // parseArray parses an array; the cursor is on its '['.
