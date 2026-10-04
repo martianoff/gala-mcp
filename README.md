@@ -61,15 +61,16 @@ func main() {
 | `NewServer(name, version) Server` | Create a server with no tools. |
 | `(Server) WithTool(t Tool) Server` | Return a copy with one more tool (immutable). |
 | `(Server) Run()` | Serve JSON-RPC over stdin/stdout until EOF. |
-| `(Server) HandleLine(line) Option[string]` | Pure core: one request line → optional response line. Ideal for tests. |
+| `(Server) HandleLine(line) Option[string]` | One request line → optional response line (a panic is logged to stderr). Ideal for tests. |
 | `Tool(Name, Description, InputSchema, Handler)` | A tool; `Handler` is `func(JsonValue) ToolResult`. |
 | `OkResult(text) / ErrResult(text)` | Build a tool result; `ErrResult` sets `isError`. |
 | `ToolResult.Text` / `ToolResult.IsError` | The result's text payload and error flag. |
 
 Report an expected tool failure with `ErrResult`, so the model can read it. A request whose
 handling panics — in a tool handler or in the server — is answered with a JSON-RPC internal
-error (`-32603`, carrying the request's id; no response for a notification), the panic is
-logged to stderr, and the server goes on serving the next request.
+error (`-32603`) carrying the request's id (a null id if the panic came before the id was
+parsed; no response for a notification). The panic is logged to stderr, and the server goes on
+serving the next request.
 
 **JSON values** — `JsonValue` is a sealed type: `JNull`, `JBool`, `JNum`, `JStr`, `JArr`, `JObj`.
 

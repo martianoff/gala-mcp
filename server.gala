@@ -5,6 +5,7 @@ import (
     "fmt"
     "io"
     "os"
+    "strconv"
     "strings"
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/go_interop"
@@ -50,7 +51,7 @@ func (s Server) serve(in io.Reader, out io.Writer) {
 
 // HandleLine processes a single raw input line and returns the response line
 // to write back, or None when the input warrants no response (a blank line or
-// a JSON-RPC notification). This is the pure core of the server and is what
+// a JSON-RPC notification). This is the core of the server and is what
 // tests drive directly.
 //
 // A panic while handling the line — in a tool handler or in the server
@@ -85,7 +86,7 @@ func (s Server) respond(request JsonValue) Option[string] =
 // is None, since a notification never gets a response. The panic value is
 // not sent to the client.
 func internalError(id Option[JsonValue], err error) Option[string] {
-    fmt.Fprintln(os.Stderr, s"mcp: request handling panicked: $err")
+    fmt.Fprintln(os.Stderr, s"mcp: request handling panicked: ${strconv.Quote(err.Error())}")
     id.Map((i) => RenderJson(errorResponse(i, CodeInternalError, "internal error")))
 }
 
