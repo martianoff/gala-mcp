@@ -1,7 +1,10 @@
 package mcp
 
 import (
+    "io"
+    "runtime"
     "strings"
+    "testing/iotest"
     . "martianoff/gala/test"
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/go_interop"
@@ -102,7 +105,7 @@ func panickyServer() Server =
 
 val boomRequest = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"boom\"}}"
 val boomNotification = "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"boom\"}}"
-val pingRequest = "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}"
+val pingRequest = pingWithId(8)
 
 // serveLines runs the stdio serving loop over the given input lines and
 // returns the non-empty output lines it wrote.
@@ -134,4 +137,229 @@ func TestServerKeepsServingAfterPanic(t T) T {
     val second = parse(out.GetOption(1).GetOrElse(""))
     val t4 = Eq(t3, second.GetInt("id").GetOrElse(-1), 8)
     IsSome(t4, second.Get("result"))
+}
+
+// --- JSON-RPC 2.0 conformance ---
+
+// reply renders HandleLine's answer to line, or "<none>" when there is none,
+// so one table can cover both responses and silence.
+func reply(line string) string = sampleServer().HandleLine(line).GetOrElse("<none>")
+
+// replyIs asserts that the sample server answers line with expected.
+func replyIs(t T, line string, expected string) T = Eq(t, reply(line), expected)
+
+// invalidRequestReply is the rendered -32600 response for id with message.
+func invalidRequestReply(id string, message string) string =
+    s"{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":-32600,\"message\":\"$message\"}}"
+
+// notification is a request for method without an id; params is its params
+// JSON, or "" for none.
+func notification(method string, params string = "") string =
+    if (params == "") s"{\"jsonrpc\":\"2.0\",\"method\":\"$method\"}"
+    else s"{\"jsonrpc\":\"2.0\",\"method\":\"$method\",\"params\":$params}"
+
+func TestNotificationsGetNoResponse(t T) T =
+    RunCases(t,
+        replyIs,
+        Case(Name = "ping", Input = notification("ping"), Expected = "<none>"),
+        Case(Name = "initialize", Input = notification("initialize"), Expected = "<none>"),
+        Case(Name = "tools/list", Input = notification("tools/list"), Expected = "<none>"),
+        Case(
+            Name = "successful tool call",
+            Input = notification("tools/call", "{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"}}"),
+            Expected = "<none>",
+        ),
+        Case(
+            Name = "unknown tool",
+            Input = notification("tools/call", "{\"name\":\"nope\"}"),
+            Expected = "<none>",
+        ),
+        Case(Name = "missing tool name", Input = notification("tools/call"), Expected = "<none>"),
+        Case(Name = "unknown method", Input = notification("bogus"), Expected = "<none>"),
+        Case(Name = "params as array", Input = notification("ping", "[]"), Expected = "<none>"),
+    )
+
+// A response object is not a request: the server sends no requests, so one
+// is stray, and it is dropped rather than answered.
+func TestResponsesGetNoResponse(t T) T =
+    RunCases(t,
+        replyIs,
+        Case(
+            Name = "result",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            Expected = "<none>",
+        ),
+        Case(
+            Name = "error",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-1,\"message\":\"x\"}}",
+            Expected = "<none>",
+        ),
+    )
+
+func TestNullParamsIsNoParams(t T) T =
+    replyIs(t, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":null}", pongWithId(1))
+
+// MCP requires a request id to be a string or an integer, never null; a
+// message whose id is anything else is an invalid request, answered with a
+// null id because its own cannot be echoed.
+func TestRequestIds(t T) T =
+    RunCases(t,
+        replyIs,
+        Case(
+            Name = "string id is echoed",
+            Input = pingWithRawId("\"a-1\""),
+            Expected = pongWithRawId("\"a-1\""),
+        ),
+        Case(Name = "integer id is echoed", Input = pingWithRawId("-3"), Expected = pongWithRawId("-3")),
+        Case(Name = "null id", Input = pingWithRawId("null"), Expected = badIdReply),
+        Case(Name = "fractional id", Input = pingWithRawId("1.5"), Expected = badIdReply),
+        Case(Name = "boolean id", Input = pingWithRawId("true"), Expected = badIdReply),
+        Case(Name = "object id", Input = pingWithRawId("{}"), Expected = badIdReply),
+        Case(
+            Name = "largest exact integer id",
+            Input = pingWithRawId("9007199254740991"),
+            Expected = pongWithRawId("9007199254740991"),
+        ),
+        Case(
+            Name = "integer id too large to echo",
+            Input = pingWithRawId("9007199254740993"),
+            Expected = badIdReply,
+        ),
+        Case(
+            Name = "null id on a notification method",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"notifications/initialized\"}",
+            Expected = badIdReply,
+        ),
+    )
+
+val badIdReply = invalidRequestReply("null", "id must be a string or an integer")
+
+// A message that is not a valid Request object is answered with -32600 and
+// its id. Without an id it was meant as a notification, and gets nothing.
+func TestInvalidRequestObjects(t T) T =
+    RunCases(t,
+        replyIs,
+        Case(
+            Name = "missing jsonrpc",
+            Input = "{\"id\":9,\"method\":\"ping\"}",
+            Expected = invalidRequestReply("9", "jsonrpc must be \\\"2.0\\\""),
+        ),
+        Case(
+            Name = "wrong jsonrpc version",
+            Input = "{\"jsonrpc\":\"1.0\",\"id\":9,\"method\":\"ping\"}",
+            Expected = invalidRequestReply("9", "jsonrpc must be \\\"2.0\\\""),
+        ),
+        Case(
+            Name = "missing method",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":9}",
+            Expected = invalidRequestReply("9", "method must be a string"),
+        ),
+        Case(
+            Name = "non-string method without id",
+            Input = "{\"jsonrpc\":\"2.0\",\"method\":1,\"params\":\"bar\"}",
+            Expected = "<none>",
+        ),
+        Case(Name = "notification without jsonrpc", Input = "{\"method\":\"ping\"}", Expected = "<none>"),
+        Case(Name = "notification with scalar params", Input = notification("ping", "1"), Expected = "<none>"),
+        Case(
+            Name = "scalar params",
+            Input = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\",\"params\":\"bar\"}",
+            Expected = invalidRequestReply("9", "params must be an object or an array"),
+        ),
+    )
+
+// MCP 2025-06-18 removed JSON-RPC batching, so an array is rejected as a
+// whole with one response, like any other message that is not an object.
+func TestNonObjectMessages(t T) T =
+    RunCases(t,
+        replyIs,
+        Case(Name = "number", Input = "42", Expected = notAnObjectReply),
+        Case(Name = "string", Input = "\"x\"", Expected = notAnObjectReply),
+        Case(Name = "boolean", Input = "true", Expected = notAnObjectReply),
+        Case(Name = "null", Input = "null", Expected = notAnObjectReply),
+        Case(Name = "empty batch", Input = "[]", Expected = noBatchesReply),
+        Case(
+            Name = "batch",
+            Input = s"[${pingWithId(1)},${notification("ping")}]",
+            Expected = noBatchesReply,
+        ),
+    )
+
+val notAnObjectReply = invalidRequestReply("null", "request must be a JSON object")
+
+val noBatchesReply = invalidRequestReply("null", "batch requests are not supported")
+
+// --- The stdio transport ---
+
+val tooLargeReply = invalidRequestReply("null", "request exceeds the 10 MiB limit")
+
+// pingWithRawId is a ping request whose id is the JSON text id.
+func pingWithRawId(id string) string = s"{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"ping\"}"
+
+// pongWithRawId is the response to pingWithRawId(id).
+func pongWithRawId(id string) string = s"{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}"
+
+func pingWithId(id int) string = pingWithRawId(s"$id")
+
+func pongWithId(id int) string = pongWithRawId(s"$id")
+
+func TestServeReturnsSuccessAtEndOfInput(t T) T {
+    val out = New[strings.Builder]()
+    IsSuccess(t, sampleServer().serve(strings.NewReader(pingWithId(1) + "\n"), out))
+}
+
+func TestOversizedLineIsRejectedAndServingContinues(t T) T {
+    val huge = strings.Repeat("x", maxLine + 1)
+    val out = serveLines(sampleServer(), ArrayOf(pingWithId(1), huge, pingWithId(2)))
+    Eq(t, out.MkString("\n"), ArrayOf(pongWithId(1), tooLargeReply, pongWithId(2)).MkString("\n"))
+}
+
+func TestLineAtTheLimitIsServed(t T) T {
+    val ping = pingWithId(1)
+    val atLimit = ping + strings.Repeat(" ", maxLine - ping.ByteSize())
+    val out = serveLines(sampleServer(), ArrayOf(atLimit, pingWithId(2)))
+    Eq(t, out.MkString("\n"), ArrayOf(pongWithId(1), pongWithId(2)).MkString("\n"))
+}
+
+func TestOversizedLastLineWithoutNewline(t T) T {
+    val out = serveLines(sampleServer(), ArrayOf(pingWithId(1), strings.Repeat("x", maxLine + 1)))
+    Eq(t, out.MkString("\n"), ArrayOf(pongWithId(1), tooLargeReply).MkString("\n"))
+}
+
+// An oversized line is discarded as it streams past, not buffered whole: a
+// 100 MiB line costs at most the 10 MiB limit in buffer growth, well under the
+// 64 MiB bound (buffering it whole would cost over 100 MiB).
+func TestOversizedLineIsNotBuffered(t T) T {
+    val input = strings.Repeat("x", 100 * 1024 * 1024) + "\n" + pingWithId(1) + "\n"
+    val out = New[strings.Builder]()
+    val before = New[runtime.MemStats]()
+    runtime.ReadMemStats(before)
+    sampleServer().serve(strings.NewReader(input), out)
+    val after = New[runtime.MemStats]()
+    runtime.ReadMemStats(after)
+    val t1 = Less(t, after.TotalAlloc - before.TotalAlloc, uint64(64 * 1024 * 1024))
+    Eq(t1, out.String(), tooLargeReply + "\n" + pongWithId(1) + "\n")
+}
+
+// A failed write means the peer is gone: serving stops at once and returns
+// the error rather than reading on.
+func TestWriteErrorStopsServing(t T) T {
+    val (peer, out) = io.Pipe()
+    peer.Close()
+    val input = strings.NewReader(ArrayOf(1, 2, 3).Map(pingWithId).MkString("\n"))
+    // One byte per read, so the input left unread shows where serving stopped.
+    val result = sampleServer().serve(iotest.OneByteReader(input), out)
+    val t1 = IsFailure(t, result)
+    Eq(t1, input.Len(), (pingWithId(2) + "\n" + pingWithId(3)).ByteSize())
+}
+
+// A CRLF line ending is not part of the message, so it does not count
+// toward the limit either.
+func TestCrlfLineAtTheLimitIsServed(t T) T {
+    val ping = pingWithId(1)
+    val atLimit = ping + strings.Repeat(" ", maxLine - ping.ByteSize())
+    val input = atLimit + "\r\n" + pingWithId(2) + "\r\n"
+    val out = New[strings.Builder]()
+    sampleServer().serve(strings.NewReader(input), out)
+    Eq(t, out.String(), pongWithId(1) + "\n" + pongWithId(2) + "\n")
 }

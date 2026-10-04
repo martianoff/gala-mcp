@@ -22,12 +22,16 @@ gala mod add github.com/martianoff/gala-mcp
 
 ## Usage
 
-A server is built by registering tools and calling `Run()`, which serves over stdio until EOF:
+A server is built by registering tools and calling `Run()`, which serves over stdio until EOF
+(or until reading stdin or writing stdout fails, which it returns as a `Failure`):
 
 ```gala
 package main
 
-import . "github.com/martianoff/gala-mcp"
+import (
+    "os"
+    . "github.com/martianoff/gala-mcp"
+)
 
 // The handler's argument is the tool call's `arguments` object.
 func greet(args JsonValue) ToolResult {
@@ -49,6 +53,7 @@ func main() {
             Handler = greet,
         ))
         .Run()
+        .OnFailure((_) => os.Exit(1)) // the client is gone; Run logged why
 }
 ```
 
@@ -60,7 +65,7 @@ func main() {
 |--------|-------------|
 | `NewServer(name, version) Server` | Create a server with no tools. |
 | `(Server) WithTool(t Tool) Server` | Return a copy with one more tool (immutable). |
-| `(Server) Run()` | Serve JSON-RPC over stdin/stdout until EOF. |
+| `(Server) Run() Try[Void]` | Serve JSON-RPC over stdin/stdout until EOF (`Success`). A failed read or write means the client is gone: it is logged to stderr and returned as a `Failure`. |
 | `(Server) HandleLine(line) Option[string]` | One request line → optional response line (a panic is logged to stderr). Ideal for tests. |
 | `Tool(Name, Description, InputSchema, Handler)` | A tool; `Handler` is `func(JsonValue) ToolResult`. |
 | `OkResult(text) / ErrResult(text)` | Build a tool result; `ErrResult` sets `isError`. |
